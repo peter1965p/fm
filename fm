@@ -1,0 +1,2 @@
+#!/bin/bash
+exec ~/Dev/fm/venv/bin/python3 ~/Dev/fm/fm.py "$@"
