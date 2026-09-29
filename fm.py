@@ -21,6 +21,7 @@ Start:
 from __future__ import annotations
 
 import fcntl
+import fnmatch
 import grp
 import json
 import os
@@ -42,7 +43,19 @@ from datetime import datetime
 from pathlib import Path
 
 import pyte
-from PySide6.QtCore import QDir, QEvent, QItemSelectionModel, QMimeDatabase, QModelIndex, QSize, QSocketNotifier, Qt, Signal
+from PySide6.QtCore import (
+    QDir,
+    QEvent,
+    QItemSelectionModel,
+    QMimeDatabase,
+    QModelIndex,
+    QObject,
+    QSize,
+    QSocketNotifier,
+    Qt,
+    QThread,
+    Signal,
+)
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -1717,6 +1730,190 @@ class PermissionsDialog(QDialog):
         return self.recursive_check is not None and self.recursive_check.isChecked()
 
 
+# --------------------------------------------------------------------------
+# Suche (Dateiname + Volltext), läuft im Hintergrund-Thread
+# --------------------------------------------------------------------------
+
+_SEARCH_CONTENT_MAX_BYTES = 5_000_000  # größere/binäre Dateien werden übersprungen
+
+
+class SearchWorker(QObject):
+    result_found = Signal(str, str)  # (Pfad, Fundstelle/Snippet — leer bei reiner Namenssuche)
+    finished = Signal(int)
+
+    def __init__(self, root: Path, name_pattern: str, content_pattern: str, case_sensitive: bool):
+        super().__init__()
+        self.root = root
+        self.name_pattern = name_pattern
+        self.content_pattern = content_pattern if case_sensitive else content_pattern.lower()
+        self.case_sensitive = case_sensitive
+        self._cancelled = False
+        self._is_glob = any(ch in name_pattern for ch in "*?[]")
+        self._name_needle = name_pattern if case_sensitive else name_pattern.lower()
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def run(self) -> None:
+        count = 0
+        for dirpath, _dirnames, filenames in os.walk(self.root):
+            if self._cancelled:
+                break
+            for fname in filenames:
+                if self._cancelled:
+                    break
+                if not self._name_matches(fname):
+                    continue
+                full = Path(dirpath) / fname
+                if self.content_pattern:
+                    snippet = self._search_content(full)
+                    if snippet is None:
+                        continue
+                    self.result_found.emit(str(full), snippet)
+                else:
+                    self.result_found.emit(str(full), "")
+                count += 1
+        self.finished.emit(count)
+
+    def _name_matches(self, fname: str) -> bool:
+        if not self.name_pattern:
+            return True
+        if self._is_glob:
+            return fnmatch.fnmatchcase(fname, self.name_pattern) if self.case_sensitive else fnmatch.fnmatch(fname, self.name_pattern)
+        compare = fname if self.case_sensitive else fname.lower()
+        return self._name_needle in compare
+
+    def _search_content(self, path: Path) -> str | None:
+        try:
+            if path.stat().st_size > _SEARCH_CONTENT_MAX_BYTES:
+                return None
+            text = path.read_text(errors="ignore")
+        except (OSError, UnicodeError):
+            return None
+        haystack = text if self.case_sensitive else text.lower()
+        idx = haystack.find(self.content_pattern)
+        if idx == -1:
+            return None
+        start = max(0, idx - 30)
+        end = min(len(text), idx + len(self.content_pattern) + 30)
+        return text[start:end].replace("\n", " ").strip()
+
+
+class SearchDialog(QDialog):
+    """Sucht rekursiv unter einem Startordner nach Dateiname (Substring
+    oder Glob wie *.py) und optional Inhalt (Textdateien bis 5 MB).
+    Läuft in einem QThread, damit die GUI währenddessen bedienbar bleibt
+    und die Suche per Knopf abbrechbar ist."""
+
+    def __init__(self, start_path: Path, navigate_callback, parent=None):
+        super().__init__(parent)
+        self.navigate_callback = navigate_callback
+        self.setWindowTitle("Suchen")
+        self.resize(680, 520)
+
+        form = QFormLayout()
+        self.root_edit = QLineEdit(str(start_path))
+        browse_btn = QPushButton("…")
+        browse_btn.setFixedWidth(30)
+        browse_btn.clicked.connect(self._browse_root)
+        root_row = QHBoxLayout()
+        root_row.addWidget(self.root_edit)
+        root_row.addWidget(browse_btn)
+        form.addRow("Ordner:", root_row)
+
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("z. B. *.py oder Teil des Namens")
+        form.addRow("Dateiname enthält:", self.name_edit)
+
+        self.content_edit = QLineEdit()
+        self.content_edit.setPlaceholderText("optional — durchsucht Textdateien bis 5 MB")
+        form.addRow("Inhalt enthält:", self.content_edit)
+
+        self.case_check = QCheckBox("Groß-/Kleinschreibung beachten")
+        form.addRow("", self.case_check)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+
+        btn_row = QHBoxLayout()
+        self.search_btn = QPushButton("Suchen")
+        self.search_btn.clicked.connect(self._start_search)
+        self.cancel_btn = QPushButton("Abbrechen")
+        self.cancel_btn.clicked.connect(self._cancel_search)
+        self.cancel_btn.setEnabled(False)
+        btn_row.addWidget(self.search_btn)
+        btn_row.addWidget(self.cancel_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        self.results = QTreeWidget(self)
+        self.results.setHeaderLabels(["Pfad", "Fundstelle"])
+        self.results.setColumnWidth(0, 400)
+        self.results.itemDoubleClicked.connect(self._open_result)
+        layout.addWidget(self.results)
+
+        self.status_label = QLabel("")
+        layout.addWidget(self.status_label)
+
+        self._thread: QThread | None = None
+        self._worker: SearchWorker | None = None
+
+    def _browse_root(self) -> None:
+        chosen = QFileDialog.getExistingDirectory(self, "Ordner wählen", self.root_edit.text())
+        if chosen:
+            self.root_edit.setText(chosen)
+
+    def _start_search(self) -> None:
+        root = Path(self.root_edit.text()).expanduser()
+        if not root.is_dir():
+            QMessageBox.warning(self, "Fehler", "Kein gültiger Ordner.")
+            return
+        name_pattern = self.name_edit.text().strip()
+        content_pattern = self.content_edit.text().strip()
+        if not name_pattern and not content_pattern:
+            QMessageBox.information(self, "Hinweis", "Bitte Dateiname und/oder Inhalt angeben.")
+            return
+
+        self.results.clear()
+        self.search_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
+        self.status_label.setText("Suche läuft …")
+
+        self._thread = QThread(self)
+        self._worker = SearchWorker(root, name_pattern, content_pattern, self.case_check.isChecked())
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.result_found.connect(self._add_result)
+        self._worker.finished.connect(self._search_finished)
+        self._worker.finished.connect(self._thread.quit)
+        self._thread.start()
+
+    def _cancel_search(self) -> None:
+        if self._worker is not None:
+            self._worker.cancel()
+
+    def _add_result(self, path: str, snippet: str) -> None:
+        self.results.addTopLevelItem(QTreeWidgetItem([path, snippet]))
+
+    def _search_finished(self, count: int) -> None:
+        prefix = "Abgebrochen" if self._worker and self._worker._cancelled else "Fertig"
+        self.status_label.setText(f"{prefix} — {count} Treffer")
+        self.search_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+
+    def _open_result(self, item: QTreeWidgetItem, _column: int) -> None:
+        self.navigate_callback(Path(item.text(0)))
+        self.accept()
+
+    def closeEvent(self, event) -> None:
+        if self._worker is not None:
+            self._worker.cancel()
+        if self._thread is not None and self._thread.isRunning():
+            self._thread.quit()
+            self._thread.wait(2000)
+        super().closeEvent(event)
+
+
 class FilePane(QWidget):
     def __init__(self, start_path: Path, status_callback, clipboard: Clipboard, parent=None):
         super().__init__(parent)
@@ -1834,6 +2031,7 @@ class FilePane(QWidget):
         _bind("Ctrl+C", self.copy_selection)
         _bind("Ctrl+X", self.cut_selection)
         _bind("Ctrl+V", self.paste)
+        _bind("Ctrl+F", self.open_search)
 
         self.navigate_to(start_path)
 
@@ -1887,6 +2085,21 @@ class FilePane(QWidget):
 
     def focus_breadcrumb_edit(self) -> None:
         self.breadcrumb.focus_edit()
+
+    def open_search(self) -> None:
+        dialog = SearchDialog(self.current_path, self._jump_to_result, self)
+        dialog.exec()
+
+    def _jump_to_result(self, path: Path) -> None:
+        target_dir = path.parent if path.is_file() else path
+        self.navigate_to(target_dir)
+        index = self.model.index(str(path))
+        if index.isValid():
+            self.selection_model.select(
+                index, QItemSelectionModel.ClearAndSelect | QItemSelectionModel.Rows
+            )
+            self.selection_model.setCurrentIndex(index, QItemSelectionModel.Current)
+            self._active_view().scrollTo(index)
 
     # ----------------------------------------------------------------
     # Auswahl-Helper
@@ -2181,6 +2394,7 @@ class FilePane(QWidget):
 
         menu = QMenu(self)
         menu.addAction("Vorschau (F3)", self.preview_selection)
+        menu.addAction("Suchen (Strg+F)", self.open_search)
         if archives:
             menu.addSeparator()
             if len(archives) == 1:
@@ -2645,6 +2859,8 @@ class MainWindow(QMainWindow):
         edit_menu.addAction("Löschen\tEntf", lambda: self.active_pane.delete_selection())
         edit_menu.addSeparator()
         edit_menu.addAction("Rechte & Eigentümer …", lambda: self.active_pane.edit_permissions())
+        edit_menu.addSeparator()
+        edit_menu.addAction("Suchen …\tStrg+F", lambda: self.active_pane.open_search())
 
         view_menu = menu_bar.addMenu("&Ansicht")
         view_menu.addAction("Listenansicht", lambda: self.active_pane._set_view_mode("list"))
