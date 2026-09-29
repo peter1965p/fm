@@ -86,6 +86,8 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListView,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMenu,
     QMessageBox,
@@ -96,6 +98,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStackedWidget,
     QStatusBar,
+    QTabBar,
     QTableWidget,
     QTableWidgetItem,
     QToolButton,
@@ -1914,6 +1917,107 @@ class SearchDialog(QDialog):
         super().closeEvent(event)
 
 
+# --------------------------------------------------------------------------
+# Lesezeichen — persistente Liste in ~/.config/fm/bookmarks.json
+# --------------------------------------------------------------------------
+
+BOOKMARKS_FILE = Path.home() / ".config" / "fm" / "bookmarks.json"
+
+
+def load_bookmarks() -> list[Path]:
+    try:
+        data = json.loads(BOOKMARKS_FILE.read_text())
+        paths = [Path(p) for p in data]
+    except (OSError, json.JSONDecodeError, TypeError):
+        paths = [Path.home()]
+    return [p for p in paths if p.is_dir()] or [Path.home()]
+
+
+def save_bookmarks(paths: list[Path]) -> None:
+    try:
+        BOOKMARKS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        BOOKMARKS_FILE.write_text(json.dumps([str(p) for p in paths]))
+    except OSError:
+        pass
+
+
+class BookmarksPanel(QWidget):
+    """Andockbare Lesezeichen-Leiste links: Klick navigiert das aktive
+    Pane dorthin, "+" merkt sich dessen aktuellen Ordner, Rechtsklick
+    entfernt einen Eintrag. Persistiert nach ~/.config/fm/bookmarks.json."""
+
+    def __init__(self, navigate_callback, get_active_dir, parent=None):
+        super().__init__(parent)
+        self.navigate_callback = navigate_callback
+        self.get_active_dir = get_active_dir
+        self.bookmarks: list[Path] = load_bookmarks()
+
+        header = QWidget(self)
+        header.setFixedHeight(22)
+        header.setStyleSheet(_FLAT_HEADER_BG)
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(8, 0, 4, 0)
+        header_layout.setSpacing(2)
+        title = QLabel("Lesezeichen", header)
+        title.setStyleSheet(_FLAT_TITLE_STYLE)
+        add_btn = QToolButton(header)
+        add_btn.setText("+")
+        add_btn.setToolTip("Aktuellen Ordner als Lesezeichen hinzufügen (Strg+D)")
+        add_btn.setStyleSheet(_FLAT_BUTTON_STYLE)
+        add_btn.clicked.connect(self.add_current)
+        header_layout.addWidget(title)
+        header_layout.addStretch()
+        header_layout.addWidget(add_btn)
+
+        self.list_widget = QListWidget(self)
+        self.list_widget.itemClicked.connect(self._on_item_clicked)
+        self.list_widget.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.list_widget.customContextMenuRequested.connect(self._show_context_menu)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(header)
+        layout.addWidget(self.list_widget)
+
+        self._refresh_list()
+
+    def _refresh_list(self) -> None:
+        self.list_widget.clear()
+        for path in self.bookmarks:
+            item = QListWidgetItem(path.name or str(path))
+            item.setToolTip(str(path))
+            item.setData(Qt.UserRole, str(path))
+            self.list_widget.addItem(item)
+
+    def _on_item_clicked(self, item: QListWidgetItem) -> None:
+        path = Path(item.data(Qt.UserRole))
+        if path.is_dir():
+            self.navigate_callback(path)
+
+    def add_current(self) -> None:
+        path = self.get_active_dir()
+        if path not in self.bookmarks:
+            self.bookmarks.append(path)
+            save_bookmarks(self.bookmarks)
+            self._refresh_list()
+
+    def _show_context_menu(self, pos) -> None:
+        item = self.list_widget.itemAt(pos)
+        if item is None:
+            return
+        menu = QMenu(self)
+        menu.addAction("Entfernen", lambda: self._remove(item))
+        menu.exec(self.list_widget.viewport().mapToGlobal(pos))
+
+    def _remove(self, item: QListWidgetItem) -> None:
+        path = Path(item.data(Qt.UserRole))
+        if path in self.bookmarks:
+            self.bookmarks.remove(path)
+            save_bookmarks(self.bookmarks)
+            self._refresh_list()
+
+
 class FilePane(QWidget):
     def __init__(self, start_path: Path, status_callback, clipboard: Clipboard, parent=None):
         super().__init__(parent)
@@ -1978,6 +2082,34 @@ class FilePane(QWidget):
         self.view_stack.addWidget(self.view)       # Index 0 = Liste
         self.view_stack.addWidget(self.grid_view)  # Index 1 = Kacheln
 
+        # Tabs teilen sich Modell und Views dieses Panes (leichtgewichtig:
+        # ein Tab ist im Kern nur ein gemerkter Pfad + Tab-Titel, kein
+        # zweiter kompletter View-Baum) — Tab wechseln heißt intern
+        # einfach navigate_to() auf den gemerkten Pfad.
+        self.tabs: list[Path] = [start_path]
+        self._switching_tab = False
+        self.tab_bar = QTabBar(self)
+        self.tab_bar.setTabsClosable(True)
+        self.tab_bar.setMovable(True)
+        self.tab_bar.setExpanding(False)
+        self.tab_bar.setDrawBase(False)
+        self.tab_bar.addTab(start_path.name or str(start_path))
+        self.tab_bar.currentChanged.connect(self._on_tab_changed)
+        self.tab_bar.tabCloseRequested.connect(self._close_tab)
+        self.tab_bar.tabMoved.connect(self._on_tab_moved)
+
+        new_tab_btn = QToolButton(self)
+        new_tab_btn.setText("+")
+        new_tab_btn.setToolTip("Neuer Tab (Strg+T)")
+        new_tab_btn.setStyleSheet(_FLAT_BUTTON_STYLE)
+        new_tab_btn.clicked.connect(self.new_tab)
+
+        tab_row = QHBoxLayout()
+        tab_row.setContentsMargins(0, 0, 0, 0)
+        tab_row.setSpacing(0)
+        tab_row.addWidget(self.tab_bar, 1)
+        tab_row.addWidget(new_tab_btn)
+
         self.breadcrumb = BreadcrumbBar(self.navigate_to, self)
 
         # Umschalt-Buttons rechts in der Breadcrumb-Zeile (nach dem Stretch
@@ -2007,6 +2139,7 @@ class FilePane(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
+        layout.addLayout(tab_row)
         layout.addWidget(self.breadcrumb)
         layout.addWidget(self.view_stack)
 
@@ -2032,6 +2165,10 @@ class FilePane(QWidget):
         _bind("Ctrl+X", self.cut_selection)
         _bind("Ctrl+V", self.paste)
         _bind("Ctrl+F", self.open_search)
+        _bind("Ctrl+T", self.new_tab)
+        _bind("Ctrl+W", lambda: self._close_tab(self.tab_bar.currentIndex()))
+        _bind("Ctrl+Tab", lambda: self._cycle_tab(1))
+        _bind("Ctrl+Shift+Tab", lambda: self._cycle_tab(-1))
 
         self.navigate_to(start_path)
 
@@ -2055,6 +2192,50 @@ class FilePane(QWidget):
         self.grid_view.setRootIndex(index)
         self.breadcrumb.set_path(path)
         self._update_status()
+
+        # Beim Wechseln über die Tab-Leiste selbst (_on_tab_changed) NICHT
+        # zurückschreiben — sonst würde jeder Tab beim Anklicken auf den
+        # zuletzt aktiven Pfad überschrieben statt seinen eigenen zu zeigen.
+        if not self._switching_tab and self.tabs:
+            idx = self.tab_bar.currentIndex()
+            if 0 <= idx < len(self.tabs):
+                self.tabs[idx] = path
+                self.tab_bar.setTabText(idx, path.name or str(path))
+
+    # ----------------------------------------------------------------
+    # Tabs
+    # ----------------------------------------------------------------
+
+    def new_tab(self) -> None:
+        path = self.current_path
+        self.tabs.append(path)
+        index = self.tab_bar.addTab(path.name or str(path))
+        self.tab_bar.setCurrentIndex(index)
+
+    def _on_tab_changed(self, index: int) -> None:
+        if index < 0 or index >= len(self.tabs):
+            return
+        self._switching_tab = True
+        try:
+            self.navigate_to(self.tabs[index])
+        finally:
+            self._switching_tab = False
+
+    def _close_tab(self, index: int) -> None:
+        if len(self.tabs) <= 1 or index < 0 or index >= len(self.tabs):
+            return
+        del self.tabs[index]
+        self.tab_bar.removeTab(index)
+
+    def _on_tab_moved(self, from_index: int, to_index: int) -> None:
+        path = self.tabs.pop(from_index)
+        self.tabs.insert(to_index, path)
+
+    def _cycle_tab(self, delta: int) -> None:
+        if len(self.tabs) <= 1:
+            return
+        new_index = (self.tab_bar.currentIndex() + delta) % len(self.tabs)
+        self.tab_bar.setCurrentIndex(new_index)
 
     def go_up(self) -> None:
         parent = self.current_path.parent
@@ -2418,6 +2599,8 @@ class FilePane(QWidget):
         menu.addSeparator()
         menu.addAction("Neuer Ordner", self.create_folder)
         menu.addAction("Neues Projekt (F7)", self.new_project)
+        menu.addSeparator()
+        menu.addAction("Neuer Tab (Strg+T)", self.new_tab)
         menu.exec(source_view.viewport().mapToGlobal(pos))
 
 
@@ -2706,6 +2889,24 @@ class TerminalWidget(QWidget):
         painter.end()
 
 
+_FLAT_HEADER_BG = "background-color: #262626;"
+_FLAT_TITLE_STYLE = "color: #888888; font-size: 11px;"
+_FLAT_BUTTON_STYLE = """
+    QToolButton {
+        color: #999999;
+        font-size: 11px;
+        border: none;
+        background: transparent;
+        padding: 2px 6px;
+    }
+    QToolButton:hover {
+        color: #eeeeee;
+        background: #3a3a3a;
+        border-radius: 3px;
+    }
+"""
+
+
 class TerminalPanel(QWidget):
     """Terminal-Widget plus schmale Kopfleiste (Titel + 'in aktuellen
     Ordner wechseln'), unten im Hauptfenster ein-/ausblendbar (F4)."""
@@ -2717,37 +2918,23 @@ class TerminalPanel(QWidget):
 
         header = QWidget(self)
         header.setFixedHeight(22)
-        header.setStyleSheet("background-color: #262626;")
+        header.setStyleSheet(_FLAT_HEADER_BG)
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(8, 0, 4, 0)
         header_layout.setSpacing(2)
 
         title = QLabel("Terminal", header)
-        title.setStyleSheet("color: #888888; font-size: 11px;")
+        title.setStyleSheet(_FLAT_TITLE_STYLE)
 
-        button_style = """
-            QToolButton {
-                color: #999999;
-                font-size: 11px;
-                border: none;
-                background: transparent;
-                padding: 2px 6px;
-            }
-            QToolButton:hover {
-                color: #eeeeee;
-                background: #3a3a3a;
-                border-radius: 3px;
-            }
-        """
         cd_btn = QToolButton(header)
         cd_btn.setText("→ aktueller Ordner")
         cd_btn.setToolTip("cd in den Ordner, der im aktiven Pane offen ist")
-        cd_btn.setStyleSheet(button_style)
+        cd_btn.setStyleSheet(_FLAT_BUTTON_STYLE)
         cd_btn.clicked.connect(lambda: self.terminal.cd_to(self._get_active_dir()))
         close_btn = QToolButton(header)
         close_btn.setText("✕")
         close_btn.setToolTip("Terminal ausblenden (F4)")
-        close_btn.setStyleSheet(button_style)
+        close_btn.setStyleSheet(_FLAT_BUTTON_STYLE)
         close_btn.clicked.connect(lambda: self.setVisible(False))
         header_layout.addWidget(title)
         header_layout.addStretch()
@@ -2780,7 +2967,8 @@ class MainWindow(QMainWindow):
         self.status.showMessage(
             "F7 Neues Projekt · Strg+C/X/V Kopieren/Ausschneiden/Einfügen · "
             "F2 Umbenennen · Entf Löschen · F3 Vorschau · F5 Refresh · "
-            "F4 Terminal · Drag&Drop zum Verschieben, Strg+Ziehen zum Kopieren"
+            "F4 Terminal · Strg+T Neuer Tab · Strg+B Lesezeichen · "
+            "Drag&Drop zum Verschieben, Strg+Ziehen zum Kopieren"
         )
 
         self.clipboard = Clipboard()
@@ -2795,11 +2983,25 @@ class MainWindow(QMainWindow):
         pane_splitter.addWidget(self.right)
         pane_splitter.setSizes([700, 700])
 
+        self.bookmarks_panel = BookmarksPanel(
+            self._navigate_active_pane, lambda: self.active_pane.current_path, self
+        )
+        self.bookmarks_panel.setMinimumWidth(120)
+        self.bookmarks_panel.setMaximumWidth(260)
+        self.bookmarks_panel.setVisible(False)
+
+        top_splitter = QSplitter(Qt.Horizontal, self)
+        top_splitter.addWidget(self.bookmarks_panel)
+        top_splitter.addWidget(pane_splitter)
+        top_splitter.setSizes([160, 1240])
+        top_splitter.setStretchFactor(0, 0)
+        top_splitter.setStretchFactor(1, 1)
+
         self.terminal_panel = TerminalPanel(lambda: self.active_pane.current_path, self)
         self.terminal_panel.setVisible(False)
 
         main_splitter = QSplitter(Qt.Vertical, self)
-        main_splitter.addWidget(pane_splitter)
+        main_splitter.addWidget(top_splitter)
         main_splitter.addWidget(self.terminal_panel)
         main_splitter.setSizes([650, 250])
         self.setCentralWidget(main_splitter)
@@ -2812,12 +3014,17 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("Tab"), self, activated=self._toggle_active_pane)
         QShortcut(QKeySequence("Ctrl+L"), self, activated=self._focus_pathbar)
         QShortcut(QKeySequence("F4"), self, activated=self._toggle_terminal)
+        QShortcut(QKeySequence("Ctrl+B"), self, activated=self._toggle_bookmarks)
+        QShortcut(QKeySequence("Ctrl+D"), self, activated=lambda: self.bookmarks_panel.add_current())
 
         self._build_menu_bar()
 
     def closeEvent(self, event) -> None:
         self.terminal_panel.shutdown()
         super().closeEvent(event)
+
+    def _navigate_active_pane(self, path: Path) -> None:
+        self.active_pane.navigate_to(path)
 
     def _toggle_terminal(self) -> None:
         visible = not self.terminal_panel.isVisible()
@@ -2827,6 +3034,9 @@ class MainWindow(QMainWindow):
             self.terminal_panel.terminal.setFocus()
         else:
             self.active_pane._active_view().setFocus()
+
+    def _toggle_bookmarks(self) -> None:
+        self.bookmarks_panel.setVisible(not self.bookmarks_panel.isVisible())
 
     # ----------------------------------------------------------------
     # Menüleiste
@@ -2844,6 +3054,9 @@ class MainWindow(QMainWindow):
         file_menu = menu_bar.addMenu("&Datei")
         file_menu.addAction("Neuer Ordner", lambda: self.active_pane.create_folder())
         file_menu.addAction("Neues Projekt …\tF7", lambda: self.active_pane.new_project())
+        file_menu.addSeparator()
+        file_menu.addAction("Neuer Tab\tStrg+T", lambda: self.active_pane.new_tab())
+        file_menu.addAction("Tab schließen\tStrg+W", lambda: self.active_pane._close_tab(self.active_pane.tab_bar.currentIndex()))
         file_menu.addSeparator()
         file_menu.addAction("Aktualisieren\tF5", lambda: self.active_pane.refresh())
         file_menu.addSeparator()
@@ -2869,6 +3082,7 @@ class MainWindow(QMainWindow):
         view_menu.addAction("Vorschau\tF3", lambda: self.active_pane.preview_selection())
         view_menu.addSeparator()
         view_menu.addAction("Terminal ein-/ausblenden\tF4", self._toggle_terminal)
+        view_menu.addAction("Lesezeichen ein-/ausblenden\tStrg+B", self._toggle_bookmarks)
 
         archive_menu = menu_bar.addMenu("A&rchiv")
         archive_menu.addAction("Archiv öffnen", lambda: self.active_pane.open_archive())
