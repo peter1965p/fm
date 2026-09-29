@@ -1120,14 +1120,111 @@ def convert_to_pdf_via_libreoffice(path: Path, outdir: Path) -> Path | None:
     return candidate if candidate.exists() else None
 
 
+# Dateityp -> Kandidaten von Icon-Namen aus dem System-Theme (freedesktop
+# Icon Naming Spec), der Reihe nach probiert. Qts eigene
+# QFileIconProvider-Auflösung über QMimeType.iconName() trifft das bei
+# vielen Alltagstypen nicht genau (v.a. Office-Open-XML-Mimetypes sind zu
+# lang/spezifisch für die meisten Themes) — hier stattdessen die üblichen,
+# von Breeze/Adwaita/etc. tatsächlich ausgelieferten generischen Namen.
+_EXTENSION_ICON_NAMES: dict[str, tuple[str, ...]] = {
+    # Office / Dokumente
+    "doc": ("application-msword", "x-office-document"),
+    "docx": ("application-vnd.openxmlformats-officedocument.wordprocessingml.document", "x-office-document"),
+    "odt": ("application-vnd.oasis.opendocument.text", "x-office-document"),
+    "rtf": ("application-rtf", "x-office-document"),
+    "xls": ("application-vnd.ms-excel", "x-office-spreadsheet"),
+    "xlsx": ("application-vnd.openxmlformats-officedocument.spreadsheetml.sheet", "x-office-spreadsheet"),
+    "ods": ("application-vnd.oasis.opendocument.spreadsheet", "x-office-spreadsheet"),
+    "csv": ("text-csv", "x-office-spreadsheet"),
+    "ppt": ("application-vnd.ms-powerpoint", "x-office-presentation"),
+    "pptx": ("application-vnd.openxmlformats-officedocument.presentationml.presentation", "x-office-presentation"),
+    "odp": ("application-vnd.oasis.opendocument.presentation", "x-office-presentation"),
+    "pdf": ("application-pdf", "x-office-document"),
+
+    # Code / Skripte
+    "py": ("text-x-python", "text-x-script"),
+    "pyw": ("text-x-python", "text-x-script"),
+    "js": ("text-x-javascript", "application-javascript"),
+    "mjs": ("text-x-javascript", "application-javascript"),
+    "ts": ("text-x-typescript", "text-x-javascript"),
+    "tsx": ("text-x-typescript", "text-x-javascript"),
+    "jsx": ("text-x-javascript",),
+    "html": ("text-html",),
+    "htm": ("text-html",),
+    "css": ("text-css",),
+    "json": ("application-json", "text-x-script"),
+    "xml": ("application-xml", "text-xml"),
+    "yaml": ("text-x-generic",),
+    "yml": ("text-x-generic",),
+    "md": ("text-markdown", "text-x-generic"),
+    "sh": ("text-x-shellscript", "application-x-shellscript"),
+    "bash": ("text-x-shellscript", "application-x-shellscript"),
+    "zsh": ("text-x-shellscript", "application-x-shellscript"),
+    "c": ("text-x-csrc",),
+    "h": ("text-x-chdr",),
+    "cpp": ("text-x-c++src",),
+    "hpp": ("text-x-c++hdr",),
+    "java": ("text-x-java",),
+    "go": ("text-x-go", "text-x-generic"),
+    "rs": ("text-x-rust", "text-x-generic"),
+    "php": ("application-x-php",),
+    "rb": ("text-x-ruby", "text-x-script"),
+    "sql": ("text-x-sql", "application-sql"),
+    "lua": ("text-x-lua",),
+    "swift": ("text-x-swift", "text-x-generic"),
+    "kt": ("text-x-kotlin", "text-x-generic"),
+
+    # Archive
+    "zip": ("application-zip", "package-x-generic"),
+    "tar": ("application-x-tar", "package-x-generic"),
+    "gz": ("application-x-compressed-tar", "package-x-generic"),
+    "tgz": ("application-x-compressed-tar", "package-x-generic"),
+    "bz2": ("application-x-bzip-compressed-tar", "package-x-generic"),
+    "xz": ("application-x-xz-compressed-tar", "package-x-generic"),
+    "7z": ("application-x-7z-compressed", "package-x-generic"),
+    "rar": ("application-x-rar", "package-x-generic"),
+
+    # Medien
+    "mp3": ("audio-x-generic",),
+    "wav": ("audio-x-generic",),
+    "flac": ("audio-x-generic",),
+    "ogg": ("audio-x-generic",),
+    "mp4": ("video-x-generic",),
+    "mkv": ("video-x-generic",),
+    "avi": ("video-x-generic",),
+    "webm": ("video-x-generic",),
+    "mov": ("video-x-generic",),
+
+    # Sonstiges
+    "txt": ("text-x-generic",),
+    "log": ("text-x-generic",),
+    "conf": ("text-x-generic",),
+    "cfg": ("text-x-generic",),
+    "ini": ("text-x-generic",),
+    "toml": ("text-x-generic",),
+    "iso": ("application-x-cd-image",),
+    "deb": ("package-x-generic",),
+    "rpm": ("package-x-generic",),
+    "exe": ("application-x-ms-dos-executable",),
+}
+
+# Für Dateien ohne (aussagekräftige) Endung, nach vollem Dateinamen (klein
+# geschrieben) statt Suffix.
+_FILENAME_ICON_NAMES: dict[str, tuple[str, ...]] = {
+    "dockerfile": ("text-x-dockerfile", "text-x-generic"),
+    "makefile": ("text-x-makefile", "text-x-generic"),
+    "cmakelists.txt": ("text-x-cmake", "text-x-generic"),
+}
+
+
 class ThumbnailIconProvider(QFileIconProvider):
-    """Standard-Icon-Provider von Qt liefert für ALLES nur generische
-    Mimetype-Icons aus dem System-Theme (Breeze usw.) — auch für Bilder.
-    Für Bilder generieren wir stattdessen ein echtes Content-Thumbnail;
-    für alles andere bleibt exakt das System-Icon erhalten (super().icon()),
-    genau das war der Wunsch: System-Icons behalten, nur Bilder als
-    echte Vorschau, konsistent — nicht wie bei Dolphin, wo das je nach
-    Ansicht/Cache-Zustand unterschiedlich ausfällt."""
+    """Standard-Icon-Provider von Qt liefert für viele Alltagstypen nur
+    generische Mimetype-Icons aus dem System-Theme (Breeze usw.), weil die
+    interne Auflösung über den vollen Mimetype-String läuft statt über die
+    Dateiendung. Deshalb hier drei Stufen: (1) Bilder bekommen ein echtes
+    Content-Thumbnail, (2) bekannte Endungen/Dateinamen (Word, Excel,
+    Python, Code, Archive, ...) bekommen gezielt passende Theme-Icons,
+    (3) alles andere fällt auf Qts Standardauflösung zurück."""
 
     THUMBNAIL_EXTENSIONS = {"png", "jpg", "jpeg", "gif", "bmp", "webp", "ico"}
     THUMBNAIL_SIZE = 96
@@ -1135,6 +1232,7 @@ class ThumbnailIconProvider(QFileIconProvider):
     def __init__(self):
         super().__init__()
         self._cache: dict[str, QIcon] = {}
+        self._themed_cache: dict[str, QIcon | None] = {}
 
     def icon(self, info) -> QIcon:  # noqa: A003 — Qt-API-Name
         # QFileIconProvider.icon() hat zwei C++-Overloads: einen mit
@@ -1143,11 +1241,16 @@ class ThumbnailIconProvider(QFileIconProvider):
         # in manchen Dialogen). Nur der erste Fall hat .isFile() usw. —
         # beim zweiten sofort an die Basisklasse durchreichen.
         try:
-            is_image_file = info.isFile() and info.suffix().lower() in self.THUMBNAIL_EXTENSIONS
+            is_file = info.isFile()
         except AttributeError:
             return super().icon(info)
 
-        if is_image_file:
+        if not is_file:
+            return super().icon(info)
+
+        suffix = info.suffix().lower()
+
+        if suffix in self.THUMBNAIL_EXTENSIONS:
             cache_key = f"{info.absoluteFilePath()}::{info.lastModified().toMSecsSinceEpoch()}"
             cached = self._cache.get(cache_key)
             if cached is not None:
@@ -1165,9 +1268,32 @@ class ThumbnailIconProvider(QFileIconProvider):
                 icon = QIcon(QPixmap.fromImage(image))
                 self._cache[cache_key] = icon
                 return icon
-            # Bild kaputt/nicht lesbar -> Fallback aufs System-Icon unten
+            # Bild kaputt/nicht lesbar -> weiter zur Theme-Icon-Zuordnung
+
+        themed = self._themed_icon(info.fileName(), suffix)
+        if themed is not None:
+            return themed
 
         return super().icon(info)
+
+    def _themed_icon(self, filename: str, suffix: str) -> QIcon | None:
+        lower_name = filename.lower()
+        key = lower_name if lower_name in _FILENAME_ICON_NAMES else suffix
+        candidates = _FILENAME_ICON_NAMES.get(lower_name) or _EXTENSION_ICON_NAMES.get(suffix)
+        if not candidates:
+            return None
+
+        if key in self._themed_cache:
+            return self._themed_cache[key]
+
+        for name in candidates:
+            icon = QIcon.fromTheme(name)
+            if not icon.isNull():
+                self._themed_cache[key] = icon
+                return icon
+
+        self._themed_cache[key] = None  # im Theme nicht vorhanden -> nicht nochmal probieren
+        return None
 
 
 class PreviewDialog(QDialog):
