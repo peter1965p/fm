@@ -3,20 +3,16 @@
 fm.py — Dual-Pane Dateimanager mit Projekt-Scaffolder (F7)
 
 Neu gegenüber der letzten Version:
-  - F7-Ambiguous-Shortcut-Bug gefixt (WidgetWithChildrenShortcut statt
-    Default WindowShortcut — sonst "beißen" sich linkes und rechtes Pane)
-  - Zielordner-Auswahl im Dialog als moderner Toggle-Switch:
-    "Hier" (aktuelles Pane-Verzeichnis) <-> "In ~/Dev"
-  - Stack-Presets erweitert: Python/Flask, Node, React (Vite), Vue (Vite),
-    Angular. Die drei Frontend-Frameworks werden über die jeweiligen
-    offiziellen CLI-Generatoren gebaut (npx create-vite / @angular/cli),
-    nicht handgestrickt — sonst fehlt sofort die Hälfte vom Tooling
-    (HMR, Build-Config, TS-Setup etc.)
+  - Menüleiste (Datei/Bearbeiten/Ansicht/Gehe zu/Hilfe)
+  - Drag & Drop zwischen den Panes und in Unterordner, Strg+Ziehen kopiert
+  - Eingebettetes Terminal (F4): echte Shell über pty.fork() + ANSI-
+    Rendering über pyte, kein QProcess-Gefrickel — Farben, vim/htop/less
+    und interaktive Prompts funktionieren wie in einem echten Terminal
 
 Voraussetzung für React/Vue/Angular: Node.js + npm/npx im PATH.
 
 Abhängigkeiten:
-    pip install PySide6
+    pip install -r requirements.txt
 
 Start:
     python3 fm.py [Startpfad]
@@ -24,17 +20,35 @@ Start:
 
 from __future__ import annotations
 
+import fcntl
 import json
+import os
+import pty
 import re
+import shlex
 import shutil
+import signal
+import struct
 import subprocess
 import sys
 import tempfile
+import termios
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QDir, QItemSelectionModel, QMimeDatabase, QModelIndex, QSize, Qt, Signal
-from PySide6.QtGui import QFont, QIcon, QImageReader, QKeySequence, QPainter, QPixmap, QShortcut
+import pyte
+from PySide6.QtCore import QDir, QEvent, QItemSelectionModel, QMimeDatabase, QModelIndex, QSize, QSocketNotifier, Qt, Signal
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QFontMetrics,
+    QIcon,
+    QImageReader,
+    QKeySequence,
+    QPainter,
+    QPixmap,
+    QShortcut,
+)
 from PySide6.QtPdf import QPdfDocument
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -1561,6 +1575,333 @@ class FilePane(QWidget):
         menu.exec(source_view.viewport().mapToGlobal(pos))
 
 
+# --------------------------------------------------------------------------
+# Eingebettetes Terminal (echtes pty + ANSI-Emulation über pyte)
+# --------------------------------------------------------------------------
+#
+# QProcess+Pipes reicht hier nicht: interaktive Programme (vim, htop, less,
+# Passwort-Prompts) brauchen ein echtes pty mit Zeilendisziplin, Farben und
+# Cursor-Steuerung. Deshalb pty.fork() (echtes Kind-Pty, keine Bibliothek
+# nötig) + pyte (reiner Python-VT100/ANSI-Interpreter) für den Bildschirm-
+# puffer, den wir selbst als Zeichengitter zeichnen.
+
+_ANSI_BASE = {
+    "black": (0, 0, 0), "red": (205, 49, 49), "green": (13, 188, 121),
+    "brown": (229, 229, 16), "yellow": (229, 229, 16), "blue": (36, 114, 200),
+    "magenta": (188, 63, 188), "cyan": (17, 168, 205), "white": (229, 229, 229),
+}
+_ANSI_BRIGHT = {
+    "black": (102, 102, 102), "red": (241, 76, 76), "green": (35, 209, 139),
+    "brown": (245, 245, 67), "yellow": (245, 245, 67), "blue": (59, 142, 234),
+    "magenta": (214, 112, 214), "cyan": (41, 184, 219), "white": (255, 255, 255),
+}
+_ANSI_256_TABLE = (
+    [_ANSI_BASE[n] for n in ("black", "red", "green", "brown", "blue", "magenta", "cyan", "white")]
+    + [_ANSI_BRIGHT[n] for n in ("black", "red", "green", "brown", "blue", "magenta", "cyan", "white")]
+)
+
+
+def _color_from_256(index: int) -> tuple[int, int, int]:
+    if index < 16:
+        return _ANSI_256_TABLE[index]
+    if index < 232:
+        index -= 16
+        r, g, b = index // 36, (index % 36) // 6, index % 6
+        scale = lambda v: 0 if v == 0 else 55 + v * 40
+        return (scale(r), scale(g), scale(b))
+    gray = 8 + (index - 232) * 10
+    return (gray, gray, gray)
+
+
+def _resolve_terminal_color(value, bold: bool, default_rgb: tuple[int, int, int]) -> QColor:
+    if value in (None, "default"):
+        return QColor(*default_rgb)
+    if isinstance(value, str) and value.isdigit():
+        return QColor(*_color_from_256(int(value)))
+    if value in _ANSI_BASE:
+        table = _ANSI_BRIGHT if bold else _ANSI_BASE
+        return QColor(*table[value])
+    return QColor(*default_rgb)
+
+
+_TERMINAL_KEY_SEQUENCES = {
+    Qt.Key_Up: b"\x1b[A",
+    Qt.Key_Down: b"\x1b[B",
+    Qt.Key_Right: b"\x1b[C",
+    Qt.Key_Left: b"\x1b[D",
+    Qt.Key_Home: b"\x1b[H",
+    Qt.Key_End: b"\x1b[F",
+    Qt.Key_Insert: b"\x1b[2~",
+    Qt.Key_Delete: b"\x1b[3~",
+    Qt.Key_PageUp: b"\x1b[5~",
+    Qt.Key_PageDown: b"\x1b[6~",
+    Qt.Key_Backspace: b"\x7f",
+    Qt.Key_Tab: b"\t",
+    Qt.Key_Return: b"\r",
+    Qt.Key_Enter: b"\r",
+    Qt.Key_Escape: b"\x1b",
+}
+
+
+class TerminalWidget(QWidget):
+    """Ein Terminal-Emulator-Widget: echte Shell über pty.fork(), Bildschirm-
+    interpretation über pyte, Rendering von Hand (kein fertiges Qt-Terminal-
+    Widget für PySide6 verfügbar)."""
+
+    def __init__(self, start_path: Path, parent=None):
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setAttribute(Qt.WA_OpaquePaintEvent, True)
+        self.setCursor(Qt.IBeamCursor)
+
+        self._font = QFont("DejaVu Sans Mono")
+        self._font.setStyleHint(QFont.Monospace)
+        self._font.setPointSize(11)
+        self._bold_font = QFont(self._font)
+        self._bold_font.setBold(True)
+        metrics = QFontMetrics(self._font)
+        self._cell_w = max(1, metrics.horizontalAdvance("M"))
+        self._cell_h = max(1, metrics.height())
+        self._ascent = metrics.ascent()
+
+        self._bg_rgb = (30, 30, 30)
+        self._fg_rgb = (220, 220, 220)
+        self._bg_color = QColor(*self._bg_rgb)
+        self._cursor_color = QColor(255, 255, 255, 140)
+
+        self.screen = pyte.HistoryScreen(80, 24, history=4000, ratio=0.5)
+        self.stream = pyte.Stream(self.screen)
+
+        self.master_fd: int | None = None
+        self.pid: int | None = None
+        self._alive = False
+        self._notifier: QSocketNotifier | None = None
+
+        self.start_shell(start_path)
+
+    # ------------------------------------------------------------
+    # Prozess-Lebenszyklus
+    # ------------------------------------------------------------
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+    def start_shell(self, cwd: Path) -> None:
+        if self._alive:
+            return
+        pid, master_fd = pty.fork()
+        if pid == 0:
+            try:
+                os.chdir(str(cwd))
+            except OSError:
+                pass
+            os.environ["TERM"] = "xterm-256color"
+            shell = os.environ.get("SHELL", "/bin/bash")
+            try:
+                os.execvp(shell, [shell])
+            except OSError:
+                os.execvp("/bin/sh", ["/bin/sh"])
+            os._exit(1)  # nur falls exec fehlschlägt
+
+        self.pid = pid
+        self.master_fd = master_fd
+        fcntl.fcntl(master_fd, fcntl.F_SETFL, os.O_NONBLOCK)
+        self._alive = True
+        self._notifier = QSocketNotifier(master_fd, QSocketNotifier.Read, self)
+        self._notifier.activated.connect(self._on_master_ready)
+        self._resize_pty(self.screen.lines, self.screen.columns)
+        self.update()
+
+    def shutdown(self) -> None:
+        """Beim Schließen des Hauptfensters: Shell (inkl. evtl. laufender
+        Kindprozesse wie Editoren) sauber beenden statt sie verwaist im
+        Hintergrund weiterlaufen zu lassen."""
+        if self._alive and self.pid:
+            try:
+                os.killpg(os.getpgid(self.pid), signal.SIGHUP)
+                os.waitpid(self.pid, 0)  # blockierend: Shell beendet sich binnen Millisekunden
+            except (ProcessLookupError, PermissionError, ChildProcessError, OSError):
+                pass
+        self._teardown()
+
+    def _teardown(self) -> None:
+        self._alive = False
+        if self._notifier is not None:
+            self._notifier.setEnabled(False)
+            self._notifier = None
+        if self.master_fd is not None:
+            try:
+                os.close(self.master_fd)
+            except OSError:
+                pass
+            self.master_fd = None
+        if self.pid is not None:
+            try:
+                os.waitpid(self.pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
+
+    def _on_master_ready(self) -> None:
+        if not self._alive or self.master_fd is None:
+            return
+        try:
+            data = os.read(self.master_fd, 65536)
+        except OSError:
+            data = b""
+        if not data:
+            self._teardown()
+            self.stream.feed(
+                "\r\n[Shell beendet — F4 schließt das Panel, "
+                "erneutes Öffnen startet eine neue Shell.]\r\n"
+            )
+            self.update()
+            return
+        self.stream.feed(data.decode("utf-8", "replace"))
+        self.update()
+
+    def _resize_pty(self, rows: int, cols: int) -> None:
+        if self.master_fd is None:
+            return
+        winsize = struct.pack("HHHH", rows, cols, 0, 0)
+        try:
+            fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, winsize)
+            if self.pid:
+                os.kill(self.pid, signal.SIGWINCH)
+        except OSError:
+            pass
+
+    def cd_to(self, path: Path) -> None:
+        if not self._alive or self.master_fd is None:
+            return
+        os.write(self.master_fd, f"cd {shlex.quote(str(path))}\n".encode())
+
+    # ------------------------------------------------------------
+    # Tastatur / Maus
+    # ------------------------------------------------------------
+
+    def event(self, event) -> bool:
+        # Verhindert, dass fm-weite Shortcuts (Tab = Pane wechseln,
+        # Strg+C/X/V, ...) Tastendrücke abfangen, während das Terminal
+        # den Fokus hat — die sollen bei der Shell ankommen. F4 bleibt
+        # bewusst ausgenommen, damit man das Panel wieder zuklappen kann.
+        if event.type() == QEvent.ShortcutOverride:
+            if event.key() != Qt.Key_F4:
+                event.accept()
+                return True
+        return super().event(event)
+
+    def keyPressEvent(self, event) -> None:
+        if not self._alive or self.master_fd is None:
+            return
+        key = event.key()
+        mods = event.modifiers()
+
+        if mods & Qt.ControlModifier and Qt.Key_A <= key <= Qt.Key_Z:
+            os.write(self.master_fd, bytes([key - Qt.Key_A + 1]))
+            return
+
+        data = _TERMINAL_KEY_SEQUENCES.get(key)
+        if data is not None:
+            os.write(self.master_fd, data)
+            return
+
+        text = event.text()
+        if text:
+            os.write(self.master_fd, text.encode("utf-8", "ignore"))
+
+    def wheelEvent(self, event) -> None:
+        if event.angleDelta().y() > 0:
+            self.screen.prev_page()
+        else:
+            self.screen.next_page()
+        self.update()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        cols = max(10, self.width() // self._cell_w)
+        rows = max(3, self.height() // self._cell_h)
+        if (rows, cols) != (self.screen.lines, self.screen.columns):
+            self.screen.resize(rows, cols)
+            self._resize_pty(rows, cols)
+
+    # ------------------------------------------------------------
+    # Rendering
+    # ------------------------------------------------------------
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), self._bg_color)
+        painter.setFont(self._font)
+        cw, ch = self._cell_w, self._cell_h
+        buffer = self.screen.buffer
+
+        for row in range(self.screen.lines):
+            line = buffer.get(row)
+            if not line:
+                continue
+            for col, char in line.items():
+                if col >= self.screen.columns:
+                    continue
+                fg = _resolve_terminal_color(char.fg, char.bold, self._fg_rgb)
+                bg = _resolve_terminal_color(char.bg, False, self._bg_rgb)
+                if char.reverse:
+                    fg, bg = bg, fg
+                x, y = col * cw, row * ch
+                if bg != self._bg_color:
+                    painter.fillRect(x, y, cw, ch, bg)
+                if char.data and char.data != " ":
+                    painter.setFont(self._bold_font if char.bold else self._font)
+                    painter.setPen(fg)
+                    painter.drawText(x, y + self._ascent, char.data)
+
+        if not self.screen.cursor.hidden and self.hasFocus():
+            cx, cy = self.screen.cursor.x, self.screen.cursor.y
+            painter.fillRect(cx * cw, cy * ch, cw, ch, self._cursor_color)
+        painter.end()
+
+
+class TerminalPanel(QWidget):
+    """Terminal-Widget plus schmale Kopfleiste (Titel + 'in aktuellen
+    Ordner wechseln'), unten im Hauptfenster ein-/ausblendbar (F4)."""
+
+    def __init__(self, get_active_dir, parent=None):
+        super().__init__(parent)
+        self._get_active_dir = get_active_dir
+        self.terminal = TerminalWidget(get_active_dir(), self)
+
+        header = QWidget(self)
+        header.setStyleSheet("background-color: #262626;")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(8, 3, 4, 3)
+        title = QLabel("Terminal", header)
+        title.setStyleSheet("color: #aaaaaa; font-weight: bold;")
+        cd_btn = QToolButton(header)
+        cd_btn.setText("→ aktueller Ordner")
+        cd_btn.setToolTip("cd in den Ordner, der im aktiven Pane offen ist")
+        cd_btn.clicked.connect(lambda: self.terminal.cd_to(self._get_active_dir()))
+        close_btn = QToolButton(header)
+        close_btn.setText("✕")
+        close_btn.setToolTip("Terminal ausblenden (F4)")
+        close_btn.clicked.connect(lambda: self.setVisible(False))
+        header_layout.addWidget(title)
+        header_layout.addStretch()
+        header_layout.addWidget(cd_btn)
+        header_layout.addWidget(close_btn)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(header)
+        layout.addWidget(self.terminal)
+
+    def ensure_alive(self) -> None:
+        if not self.terminal.is_alive():
+            self.terminal.start_shell(self._get_active_dir())
+
+    def shutdown(self) -> None:
+        self.terminal.shutdown()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, start_path: Path):
         super().__init__()
@@ -1573,7 +1914,7 @@ class MainWindow(QMainWindow):
         self.status.showMessage(
             "F7 Neues Projekt · Strg+C/X/V Kopieren/Ausschneiden/Einfügen · "
             "F2 Umbenennen · Entf Löschen · F3 Vorschau · F5 Refresh · "
-            "Drag&Drop zum Verschieben, Strg+Ziehen zum Kopieren"
+            "F4 Terminal · Drag&Drop zum Verschieben, Strg+Ziehen zum Kopieren"
         )
 
         self.clipboard = Clipboard()
@@ -1583,11 +1924,19 @@ class MainWindow(QMainWindow):
         self.right.sibling = self.left
         self.active_pane = self.left
 
-        splitter = QSplitter(Qt.Horizontal, self)
-        splitter.addWidget(self.left)
-        splitter.addWidget(self.right)
-        splitter.setSizes([700, 700])
-        self.setCentralWidget(splitter)
+        pane_splitter = QSplitter(Qt.Horizontal, self)
+        pane_splitter.addWidget(self.left)
+        pane_splitter.addWidget(self.right)
+        pane_splitter.setSizes([700, 700])
+
+        self.terminal_panel = TerminalPanel(lambda: self.active_pane.current_path, self)
+        self.terminal_panel.setVisible(False)
+
+        main_splitter = QSplitter(Qt.Vertical, self)
+        main_splitter.addWidget(pane_splitter)
+        main_splitter.addWidget(self.terminal_panel)
+        main_splitter.setSizes([650, 250])
+        self.setCentralWidget(main_splitter)
 
         self.left.view.clicked.connect(lambda _: self._set_active(self.left))
         self.left.grid_view.clicked.connect(lambda _: self._set_active(self.left))
@@ -1596,8 +1945,22 @@ class MainWindow(QMainWindow):
 
         QShortcut(QKeySequence("Tab"), self, activated=self._toggle_active_pane)
         QShortcut(QKeySequence("Ctrl+L"), self, activated=self._focus_pathbar)
+        QShortcut(QKeySequence("F4"), self, activated=self._toggle_terminal)
 
         self._build_menu_bar()
+
+    def closeEvent(self, event) -> None:
+        self.terminal_panel.shutdown()
+        super().closeEvent(event)
+
+    def _toggle_terminal(self) -> None:
+        visible = not self.terminal_panel.isVisible()
+        self.terminal_panel.setVisible(visible)
+        if visible:
+            self.terminal_panel.ensure_alive()
+            self.terminal_panel.terminal.setFocus()
+        else:
+            self.active_pane._active_view().setFocus()
 
     # ----------------------------------------------------------------
     # Menüleiste
@@ -1634,6 +1997,8 @@ class MainWindow(QMainWindow):
         view_menu.addAction("Kachelansicht", lambda: self.active_pane._set_view_mode("grid"))
         view_menu.addSeparator()
         view_menu.addAction("Vorschau\tF3", lambda: self.active_pane.preview_selection())
+        view_menu.addSeparator()
+        view_menu.addAction("Terminal ein-/ausblenden\tF4", self._toggle_terminal)
 
         go_menu = menu_bar.addMenu("&Gehe zu")
         go_menu.addAction("Nach oben\tBackspace", lambda: self.active_pane.go_up())
