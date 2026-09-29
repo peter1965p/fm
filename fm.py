@@ -21,13 +21,16 @@ Start:
 from __future__ import annotations
 
 import fcntl
+import grp
 import json
 import os
 import pty
+import pwd
 import re
 import shlex
 import shutil
 import signal
+import stat
 import struct
 import subprocess
 import sys
@@ -1568,6 +1571,152 @@ class FileListView(_DropTargetMixin, QListView):
     pass
 
 
+# --------------------------------------------------------------------------
+# Rechte & Eigentümer (chmod/chown)
+# --------------------------------------------------------------------------
+
+_PERMISSION_BITS = {
+    ("owner", "r"): stat.S_IRUSR, ("owner", "w"): stat.S_IWUSR, ("owner", "x"): stat.S_IXUSR,
+    ("group", "r"): stat.S_IRGRP, ("group", "w"): stat.S_IWGRP, ("group", "x"): stat.S_IXGRP,
+    ("other", "r"): stat.S_IROTH, ("other", "w"): stat.S_IWOTH, ("other", "x"): stat.S_IXOTH,
+}
+
+
+def _resolve_uid(name: str) -> int:
+    try:
+        return pwd.getpwnam(name).pw_uid
+    except KeyError:
+        try:
+            return int(name)
+        except ValueError:
+            return -1
+
+
+def _resolve_gid(name: str) -> int:
+    try:
+        return grp.getgrnam(name).gr_gid
+    except KeyError:
+        try:
+            return int(name)
+        except ValueError:
+            return -1
+
+
+class PermissionsDialog(QDialog):
+    """chmod-Matrix (mit Oktal-Feld, beide Richtungen live synchron) +
+    chown über Besitzer/Gruppen-Dropdown, vorbelegt mit den Werten des
+    ersten ausgewählten Objekts. Bei mehreren Objekten wird beim OK genau
+    dieser eine Rechte-/Eigentümer-Zustand auf alle angewendet, keine
+    Tristate-Fummelei."""
+
+    def __init__(self, paths: list[Path], parent=None):
+        super().__init__(parent)
+        self.paths = paths
+        first = paths[0]
+        st = first.stat()
+        mode = stat.S_IMODE(st.st_mode)
+
+        title = first.name if len(paths) == 1 else f"{len(paths)} Objekte"
+        self.setWindowTitle(f"Rechte & Eigentümer — {title}")
+
+        layout = QVBoxLayout(self)
+
+        matrix = QWidget(self)
+        matrix_layout = QVBoxLayout(matrix)
+        head = QHBoxLayout()
+        head.addWidget(QLabel(""), 1)
+        for label in ("Lesen", "Schreiben", "Ausführen"):
+            lbl = QLabel(label)
+            lbl.setFixedWidth(80)
+            head.addWidget(lbl)
+        matrix_layout.addLayout(head)
+
+        self.checks: dict[tuple[str, str], QCheckBox] = {}
+        for group_key, group_label in (("owner", "Besitzer"), ("group", "Gruppe"), ("other", "Andere")):
+            row = QHBoxLayout()
+            row.addWidget(QLabel(group_label), 1)
+            for perm in ("r", "w", "x"):
+                cb = QCheckBox()
+                cb.setFixedWidth(80)
+                cb.setChecked(bool(mode & _PERMISSION_BITS[(group_key, perm)]))
+                cb.toggled.connect(self._update_octal_from_checks)
+                self.checks[(group_key, perm)] = cb
+                row.addWidget(cb)
+            matrix_layout.addLayout(row)
+        layout.addWidget(matrix)
+
+        octal_row = QHBoxLayout()
+        octal_row.addWidget(QLabel("Oktal:"))
+        self.octal_edit = QLineEdit(f"{mode:03o}")
+        self.octal_edit.setFixedWidth(60)
+        self.octal_edit.editingFinished.connect(self._apply_octal_to_checks)
+        octal_row.addWidget(self.octal_edit)
+        octal_row.addStretch()
+        layout.addLayout(octal_row)
+
+        owner_row = QFormLayout()
+        self.owner_combo = QComboBox()
+        self.group_combo = QComboBox()
+        try:
+            users = sorted(pwd.getpwall(), key=lambda u: u.pw_name)
+            self.owner_combo.addItems([u.pw_name for u in users])
+            idx = self.owner_combo.findText(pwd.getpwuid(st.st_uid).pw_name)
+            if idx >= 0:
+                self.owner_combo.setCurrentIndex(idx)
+        except Exception:
+            self.owner_combo.addItem(str(st.st_uid))
+        try:
+            groups = sorted(grp.getgrall(), key=lambda g: g.gr_name)
+            self.group_combo.addItems([g.gr_name for g in groups])
+            idx = self.group_combo.findText(grp.getgrgid(st.st_gid).gr_name)
+            if idx >= 0:
+                self.group_combo.setCurrentIndex(idx)
+        except Exception:
+            self.group_combo.addItem(str(st.st_gid))
+        owner_row.addRow("Besitzer:", self.owner_combo)
+        owner_row.addRow("Gruppe:", self.group_combo)
+        layout.addLayout(owner_row)
+
+        self.recursive_check = None
+        if any(p.is_dir() for p in paths):
+            self.recursive_check = QCheckBox("Auf Ordnerinhalt anwenden (rekursiv)")
+            layout.addWidget(self.recursive_check)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _update_octal_from_checks(self) -> None:
+        self.octal_edit.setText(f"{self.selected_mode():03o}")
+
+    def _apply_octal_to_checks(self) -> None:
+        try:
+            mode = int(self.octal_edit.text().strip(), 8)
+        except ValueError:
+            return
+        for key, cb in self.checks.items():
+            cb.blockSignals(True)
+            cb.setChecked(bool(mode & _PERMISSION_BITS[key]))
+            cb.blockSignals(False)
+
+    def selected_mode(self) -> int:
+        mode = 0
+        for key, cb in self.checks.items():
+            if cb.isChecked():
+                mode |= _PERMISSION_BITS[key]
+        return mode
+
+    def selected_owner(self) -> str:
+        return self.owner_combo.currentText()
+
+    def selected_group(self) -> str:
+        return self.group_combo.currentText()
+
+    def is_recursive(self) -> bool:
+        return self.recursive_check is not None and self.recursive_check.isChecked()
+
+
 class FilePane(QWidget):
     def __init__(self, start_path: Path, status_callback, clipboard: Clipboard, parent=None):
         super().__init__(parent)
@@ -1950,6 +2099,54 @@ class FilePane(QWidget):
             return
         PreviewDialog(paths[0], self).exec()
 
+    def edit_permissions(self) -> None:
+        paths = self._selected_paths()
+        if not paths:
+            return
+        dialog = PermissionsDialog(paths, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+
+        mode = dialog.selected_mode()
+        wanted_uid = _resolve_uid(dialog.selected_owner())
+        wanted_gid = _resolve_gid(dialog.selected_group())
+
+        targets: list[Path] = []
+        for p in paths:
+            targets.append(p)
+            if dialog.is_recursive() and p.is_dir():
+                targets.extend(p.rglob("*"))
+
+        errors: list[str] = []
+        for target in targets:
+            try:
+                os.chmod(target, mode)
+            except Exception as exc:
+                errors.append(f"{target.name} (Rechte): {exc}")
+
+            try:
+                st = target.stat()
+            except OSError:
+                continue
+            # Nur tatsächlich abweichende IDs setzen — chown auf die
+            # bereits vorhandene eigene uid schlägt bei normalen Nutzern
+            # mit "Operation not permitted" fehl (POSIX _POSIX_CHOWN_RESTRICTED),
+            # auch wenn sich am Ergebnis nichts ändern würde.
+            chown_uid = wanted_uid if wanted_uid not in (-1, st.st_uid) else -1
+            chown_gid = wanted_gid if wanted_gid not in (-1, st.st_gid) else -1
+            if chown_uid != -1 or chown_gid != -1:
+                try:
+                    os.chown(target, chown_uid, chown_gid)
+                except Exception as exc:
+                    errors.append(f"{target.name} (Besitzer): {exc}")
+
+        self._refresh_all()
+        if errors:
+            shown = errors[:20]
+            if len(errors) > 20:
+                shown.append(f"… und {len(errors) - 20} weitere")
+            QMessageBox.warning(self, "Teilweise fehlgeschlagen", "\n".join(shown))
+
     def create_folder(self) -> None:
         name, ok = QInputDialog.getText(self, "Neuer Ordner", "Name:")
         if ok and name.strip():
@@ -1999,6 +2196,7 @@ class FilePane(QWidget):
         menu.addAction("Umbenennen (F2)", self.rename_selection)
         menu.addAction("Löschen (Entf)", self.delete_selection)
         if selected_paths:
+            menu.addAction("Rechte & Eigentümer …", self.edit_permissions)
             menu.addSeparator()
             compress_menu = menu.addMenu("Komprimieren zu …")
             for fmt, (_suffix, label) in _COMPRESS_FORMATS.items():
@@ -2445,6 +2643,8 @@ class MainWindow(QMainWindow):
         edit_menu.addSeparator()
         edit_menu.addAction("Umbenennen\tF2", lambda: self.active_pane.rename_selection())
         edit_menu.addAction("Löschen\tEntf", lambda: self.active_pane.delete_selection())
+        edit_menu.addSeparator()
+        edit_menu.addAction("Rechte & Eigentümer …", lambda: self.active_pane.edit_permissions())
 
         view_menu = menu_bar.addMenu("&Ansicht")
         view_menu.addAction("Listenansicht", lambda: self.active_pane._set_view_mode("list"))
