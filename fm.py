@@ -1870,18 +1870,38 @@ class TerminalPanel(QWidget):
         self.terminal = TerminalWidget(get_active_dir(), self)
 
         header = QWidget(self)
+        header.setFixedHeight(22)
         header.setStyleSheet("background-color: #262626;")
         header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(8, 3, 4, 3)
+        header_layout.setContentsMargins(8, 0, 4, 0)
+        header_layout.setSpacing(2)
+
         title = QLabel("Terminal", header)
-        title.setStyleSheet("color: #aaaaaa; font-weight: bold;")
+        title.setStyleSheet("color: #888888; font-size: 11px;")
+
+        button_style = """
+            QToolButton {
+                color: #999999;
+                font-size: 11px;
+                border: none;
+                background: transparent;
+                padding: 2px 6px;
+            }
+            QToolButton:hover {
+                color: #eeeeee;
+                background: #3a3a3a;
+                border-radius: 3px;
+            }
+        """
         cd_btn = QToolButton(header)
         cd_btn.setText("→ aktueller Ordner")
         cd_btn.setToolTip("cd in den Ordner, der im aktiven Pane offen ist")
+        cd_btn.setStyleSheet(button_style)
         cd_btn.clicked.connect(lambda: self.terminal.cd_to(self._get_active_dir()))
         close_btn = QToolButton(header)
         close_btn.setText("✕")
         close_btn.setToolTip("Terminal ausblenden (F4)")
+        close_btn.setStyleSheet(button_style)
         close_btn.clicked.connect(lambda: self.setVisible(False))
         header_layout.addWidget(title)
         header_layout.addStretch()
