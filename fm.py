@@ -31,8 +31,10 @@ import signal
 import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import termios
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -58,6 +60,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFileIconProvider,
     QFileSystemModel,
     QFormLayout,
@@ -81,6 +84,8 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QToolButton,
     QTreeView,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -869,6 +874,223 @@ def unique_destination(dest: Path) -> Path:
         counter += 1
 
 
+# --------------------------------------------------------------------------
+# Archive: entpacken, packen, Inhalt durchsuchen (zip + tar-Familie über
+# die Standardbibliothek — keine externen Abhängigkeiten nötig)
+# --------------------------------------------------------------------------
+
+_TAR_MULTI_SUFFIXES = (".tar.gz", ".tar.bz2", ".tar.xz")
+_TAR_SINGLE_SUFFIXES = (".tar", ".tgz", ".tbz2", ".txz")
+
+_COMPRESS_FORMATS = {
+    "zip": (".zip", "ZIP-Archiv (.zip)"),
+    "tar.gz": (".tar.gz", "TAR.GZ-Archiv (.tar.gz)"),
+    "tar.bz2": (".tar.bz2", "TAR.BZ2-Archiv (.tar.bz2)"),
+    "tar.xz": (".tar.xz", "TAR.XZ-Archiv (.tar.xz)"),
+}
+
+
+def _archive_kind(path: Path) -> str | None:
+    name = path.name.lower()
+    if name.endswith(_TAR_MULTI_SUFFIXES) or name.endswith(_TAR_SINGLE_SUFFIXES):
+        return "tar"
+    if name.endswith(".zip"):
+        return "zip"
+    return None
+
+
+def is_archive(path: Path) -> bool:
+    return path.is_file() and _archive_kind(path) is not None
+
+
+def archive_stem(path: Path) -> str:
+    """Name ohne Archiv-Endung — bei .tar.gz & Co. beide Teile abschneiden,
+    nicht nur .gz, sonst heißt der entpackte Ordner 'foo.tar'."""
+    name = path.name
+    for suf in _TAR_MULTI_SUFFIXES:
+        if name.lower().endswith(suf):
+            return name[: -len(suf)]
+    return path.stem
+
+
+def list_archive_entries(path: Path) -> list[tuple[str, bool, int]]:
+    """Liefert (Pfad-im-Archiv, ist_verzeichnis, Größe) je Eintrag."""
+    kind = _archive_kind(path)
+    entries: list[tuple[str, bool, int]] = []
+    if kind == "zip":
+        with zipfile.ZipFile(path) as zf:
+            for info in zf.infolist():
+                entries.append((info.filename.rstrip("/"), info.is_dir(), info.file_size))
+    elif kind == "tar":
+        with tarfile.open(path) as tf:
+            for member in tf.getmembers():
+                entries.append((member.name.rstrip("/"), member.isdir(), member.size))
+    return entries
+
+
+def extract_archive(path: Path, dest_dir: Path, members: list[str] | None = None) -> None:
+    """Entpackt nach dest_dir. members=None -> alles; sonst nur die
+    angegebenen Pfade (inkl. aller Kind-Einträge, falls ein Ordner
+    ausgewählt wurde)."""
+    kind = _archive_kind(path)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    if kind == "zip":
+        with zipfile.ZipFile(path) as zf:
+            names = zf.namelist()
+            if members is None:
+                wanted = names
+            else:
+                exact = {m.rstrip("/") for m in members}
+                prefixes = tuple(m.rstrip("/") + "/" for m in members)
+                wanted = [n for n in names if n.rstrip("/") in exact or n.startswith(prefixes)]
+            zf.extractall(dest_dir, members=wanted)
+    elif kind == "tar":
+        with tarfile.open(path) as tf:
+            all_members = tf.getmembers()
+            if members is not None:
+                exact = {m.rstrip("/") for m in members}
+                prefixes = tuple(m.rstrip("/") + "/" for m in members)
+                all_members = [m for m in all_members if m.name.rstrip("/") in exact or m.name.startswith(prefixes)]
+            tf.extractall(dest_dir, members=all_members, filter="data")
+    else:
+        raise ValueError(f"Unbekanntes Archivformat: {path.name}")
+
+
+def create_archive(sources: list[Path], dest: Path, fmt: str) -> None:
+    if fmt == "zip":
+        with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as zf:
+            for src in sources:
+                base = src.parent
+                if src.is_dir():
+                    for entry in sorted(src.rglob("*")):
+                        arcname = str(entry.relative_to(base))
+                        if entry.is_dir():
+                            zf.writestr(arcname + "/", "")
+                        else:
+                            zf.write(entry, arcname=arcname)
+                    if not any(src.iterdir()):
+                        zf.writestr(str(src.relative_to(base)) + "/", "")
+                else:
+                    zf.write(src, arcname=src.name)
+        return
+
+    mode = {"tar.gz": "w:gz", "tar.bz2": "w:bz2", "tar.xz": "w:xz"}.get(fmt)
+    if mode is None:
+        raise ValueError(f"Unbekanntes Zielformat: {fmt}")
+    with tarfile.open(dest, mode) as tf:
+        for src in sources:
+            tf.add(src, arcname=src.name)
+
+
+def human_size(num_bytes: int) -> str:
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+class ArchiveViewerDialog(QDialog):
+    """Inhalt eines Archivs als Baum anzeigen — das ist unser Ersatz für
+    'in ein Archiv reinklicken wie in einen Ordner': QFileSystemModel
+    kennt nur echte Verzeichnisse, ein virtuelles archive://-Dateisystem
+    dafür umzubauen wäre ein eigenes Projekt. Der Dialog deckt den
+    eigentlichen Bedarf (reinschauen + gezielt entpacken) ohne den
+    Aufwand."""
+
+    def __init__(self, archive_path: Path, parent=None):
+        super().__init__(parent)
+        self.archive_path = archive_path
+        self.setWindowTitle(f"Archiv: {archive_path.name}")
+        self.resize(560, 500)
+
+        self.tree = QTreeWidget(self)
+        self.tree.setHeaderLabels(["Name", "Größe"])
+        self.tree.setColumnWidth(0, 340)
+        self.tree.setSelectionMode(QTreeWidget.ExtendedSelection)
+        self._populate()
+
+        extract_all_btn = QPushButton("Alles entpacken nach …", self)
+        extract_all_btn.clicked.connect(self._extract_all)
+        extract_sel_btn = QPushButton("Auswahl entpacken nach …", self)
+        extract_sel_btn.clicked.connect(self._extract_selected)
+        close_btn = QPushButton("Schließen", self)
+        close_btn.clicked.connect(self.reject)
+
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(extract_all_btn)
+        btn_row.addWidget(extract_sel_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(close_btn)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.tree)
+        layout.addLayout(btn_row)
+
+    def _populate(self) -> None:
+        try:
+            entries = list_archive_entries(self.archive_path)
+        except Exception as exc:
+            QMessageBox.warning(self, "Fehler beim Lesen", str(exc))
+            entries = []
+
+        nodes: dict[str, QTreeWidgetItem] = {}
+        for name, is_dir, size in sorted(entries, key=lambda e: e[0]):
+            if not name:
+                continue
+            parts = name.split("/")
+            path_acc = ""
+            for i, part in enumerate(parts):
+                path_acc = f"{path_acc}/{part}" if path_acc else part
+                if path_acc in nodes:
+                    continue
+                is_last = i == len(parts) - 1
+                size_text = "" if (not is_last or is_dir) else human_size(size)
+                item = QTreeWidgetItem([part, size_text])
+                parent_path = path_acc.rsplit("/", 1)[0] if "/" in path_acc else None
+                if parent_path and parent_path in nodes:
+                    nodes[parent_path].addChild(item)
+                else:
+                    self.tree.addTopLevelItem(item)
+                nodes[path_acc] = item
+
+    def _full_path(self, item: QTreeWidgetItem) -> str:
+        parts = [item.text(0)]
+        parent = item.parent()
+        while parent is not None:
+            parts.insert(0, parent.text(0))
+            parent = parent.parent()
+        return "/".join(parts)
+
+    def _extract_all(self) -> None:
+        chosen = QFileDialog.getExistingDirectory(self, "Entpacken nach …", str(self.archive_path.parent))
+        if not chosen:
+            return
+        target = unique_destination(Path(chosen) / archive_stem(self.archive_path))
+        try:
+            extract_archive(self.archive_path, target)
+            QMessageBox.information(self, "Fertig", f"Entpackt nach:\n{target}")
+        except Exception as exc:
+            QMessageBox.warning(self, "Fehler", str(exc))
+
+    def _extract_selected(self) -> None:
+        items = self.tree.selectedItems()
+        if not items:
+            QMessageBox.information(self, "Nichts ausgewählt", "Bitte Einträge in der Liste markieren.")
+            return
+        chosen = QFileDialog.getExistingDirectory(self, "Auswahl entpacken nach …", str(self.archive_path.parent))
+        if not chosen:
+            return
+        members = [self._full_path(item) for item in items]
+        try:
+            extract_archive(self.archive_path, Path(chosen), members=members)
+            QMessageBox.information(self, "Fertig", f"Entpackt nach:\n{chosen}")
+        except Exception as exc:
+            QMessageBox.warning(self, "Fehler", str(exc))
+
+
 OFFICE_MIME_TYPES = {
     # Modern (OOXML)
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",  # docx
@@ -1378,6 +1600,8 @@ class FilePane(QWidget):
         path = Path(self.model.filePath(index))
         if path.is_dir():
             self.navigate_to(path)
+        elif is_archive(path):
+            ArchiveViewerDialog(path, self).exec()
         else:
             open_with_default_app(path)
 
@@ -1493,6 +1717,76 @@ class FilePane(QWidget):
             QMessageBox.warning(self, "Teilweise fehlgeschlagen", "\n".join(errors))
 
     # ----------------------------------------------------------------
+    # Archive: entpacken / packen
+    # ----------------------------------------------------------------
+
+    def open_archive(self) -> None:
+        paths = self._selected_paths()
+        if paths and is_archive(paths[0]):
+            ArchiveViewerDialog(paths[0], self).exec()
+
+    def extract_here(self) -> None:
+        archives = [p for p in self._selected_paths() if is_archive(p)]
+        if not archives:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        errors: list[str] = []
+        try:
+            for archive in archives:
+                dest = unique_destination(self.current_path / archive_stem(archive))
+                try:
+                    extract_archive(archive, dest)
+                except Exception as exc:
+                    errors.append(f"{archive.name}: {exc}")
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._refresh_all()
+        if errors:
+            QMessageBox.warning(self, "Teilweise fehlgeschlagen", "\n".join(errors))
+
+    def extract_to(self) -> None:
+        archives = [p for p in self._selected_paths() if is_archive(p)]
+        if not archives:
+            return
+        chosen = QFileDialog.getExistingDirectory(self, "Entpacken nach …", str(self.current_path))
+        if not chosen:
+            return
+        target_base = Path(chosen)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        errors: list[str] = []
+        try:
+            for archive in archives:
+                dest = unique_destination(target_base / archive_stem(archive))
+                try:
+                    extract_archive(archive, dest)
+                except Exception as exc:
+                    errors.append(f"{archive.name}: {exc}")
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._refresh_all()
+        if errors:
+            QMessageBox.warning(self, "Teilweise fehlgeschlagen", "\n".join(errors))
+
+    def compress_selection(self, fmt: str) -> None:
+        paths = self._selected_paths()
+        if not paths:
+            return
+        suffix, _label = _COMPRESS_FORMATS[fmt]
+        default_name = (paths[0].stem if len(paths) == 1 else "archiv") + suffix
+        name, ok = QInputDialog.getText(self, "Archiv erstellen", "Dateiname:", text=default_name)
+        if not ok or not name.strip():
+            return
+        dest = unique_destination(self.current_path / name.strip())
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            create_archive(paths, dest, fmt)
+        except Exception as exc:
+            QMessageBox.warning(self, "Fehler", str(exc))
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._refresh_all()
+
+    # ----------------------------------------------------------------
     # Löschen (Papierkorb) / Umbenennen / Vorschau
     # ----------------------------------------------------------------
 
@@ -1559,8 +1853,17 @@ class FilePane(QWidget):
             )
             self.selection_model.setCurrentIndex(index_at_pos, QItemSelectionModel.Current)
 
+        selected_paths = self._selected_paths()
+        archives = [p for p in selected_paths if is_archive(p)]
+
         menu = QMenu(self)
         menu.addAction("Vorschau (F3)", self.preview_selection)
+        if archives:
+            menu.addSeparator()
+            if len(archives) == 1:
+                menu.addAction("Archiv öffnen", self.open_archive)
+            menu.addAction("Hier entpacken", self.extract_here)
+            menu.addAction("Entpacken nach …", self.extract_to)
         menu.addSeparator()
         menu.addAction("Ausschneiden (Strg+X)", self.cut_selection)
         menu.addAction("Kopieren (Strg+C)", self.copy_selection)
@@ -1569,6 +1872,11 @@ class FilePane(QWidget):
         menu.addSeparator()
         menu.addAction("Umbenennen (F2)", self.rename_selection)
         menu.addAction("Löschen (Entf)", self.delete_selection)
+        if selected_paths:
+            menu.addSeparator()
+            compress_menu = menu.addMenu("Komprimieren zu …")
+            for fmt, (_suffix, label) in _COMPRESS_FORMATS.items():
+                compress_menu.addAction(label, lambda checked=False, f=fmt: self.compress_selection(f))
         menu.addSeparator()
         menu.addAction("Neuer Ordner", self.create_folder)
         menu.addAction("Neues Projekt (F7)", self.new_project)
@@ -2019,6 +2327,17 @@ class MainWindow(QMainWindow):
         view_menu.addAction("Vorschau\tF3", lambda: self.active_pane.preview_selection())
         view_menu.addSeparator()
         view_menu.addAction("Terminal ein-/ausblenden\tF4", self._toggle_terminal)
+
+        archive_menu = menu_bar.addMenu("A&rchiv")
+        archive_menu.addAction("Archiv öffnen", lambda: self.active_pane.open_archive())
+        archive_menu.addAction("Hier entpacken", lambda: self.active_pane.extract_here())
+        archive_menu.addAction("Entpacken nach …", lambda: self.active_pane.extract_to())
+        archive_menu.addSeparator()
+        for fmt, (_suffix, label) in _COMPRESS_FORMATS.items():
+            archive_menu.addAction(
+                f"Auswahl komprimieren zu {label}",
+                lambda checked=False, f=fmt: self.active_pane.compress_selection(f),
+            )
 
         go_menu = menu_bar.addMenu("&Gehe zu")
         go_menu.addAction("Nach oben\tBackspace", lambda: self.active_pane.go_up())
