@@ -3,6 +3,14 @@
 Ein Dual-Pane-Dateimanager für Linux (PySide6/Qt), mit eingebettetem Terminal,
 Archiv-Unterstützung und einem Projekt-Generator für neue Entwicklungsprojekte.
 
+## Screenshots
+
+![fm – Dual-Pane](assets/fm.png)
+
+![Neues Projekt (F7)](assets/fm.new.project.png)
+
+![Projektauswahl](assets/fm.project.selection.png)
+
 ## Funktionen
 
 **Dateiverwaltung**
