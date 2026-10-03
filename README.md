@@ -110,4 +110,6 @@ requirements.txt   Python-Abhängigkeiten (PySide6, pyte)
 
 ## Lizenz
 
-Noch nicht festgelegt.
+GNU General Public License v3.0 oder neuer — siehe [LICENSE](LICENSE).
+Du darfst fm frei nutzen, verändern und weitergeben, solange abgeleitete Versionen
+unter derselben Lizenz bleiben.

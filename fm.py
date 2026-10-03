@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 fm.py — Dual-Pane Dateimanager mit Projekt-Scaffolder (F7)
+Copyright (C) 2026 peter1965p — GPL-3.0-or-later, siehe LICENSE
 
 Neu gegenüber der letzten Version:
   - Menüleiste (Datei/Bearbeiten/Ansicht/Gehe zu/Hilfe)
