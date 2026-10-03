@@ -2031,6 +2031,7 @@ class FilePane(QWidget):
         self.model = QFileSystemModel(self)
         self.model.setRootPath(QDir.rootPath())
         self.model.setFilter(QDir.AllEntries | QDir.NoDotAndDotDot | QDir.Hidden)
+        self.model.setReadOnly(False)  # Standard ist True -> Umbenennen (F2) wird verweigert
         self.model.setIconProvider(ThumbnailIconProvider())
 
         # Geteiltes Selection-Model: beide Views (Liste + Kacheln) tragen
