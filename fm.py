@@ -190,16 +190,58 @@ def open_with_default_app(path: Path) -> None:
 
 
 # kind:
-#   "manual-python" / "manual-node" / "manual-other" -> wir erzeugen die
-#       Basisdateien selbst (schnell, kein Netzwerk nötig)
-#   "npx" -> wir rufen den offiziellen CLI-Generator auf (braucht Node/npm,
-#       Internet beim ersten Mal, dauert ein paar Sekunden)
+#   "python" -> ein echtes venv wird angelegt und die Pakete installiert
+#       (pip), welches Grundgerüst entsteht steuert "template" (siehe
+#       _scaffold_python) — schnell, kein Netzwerk nötig außer für pip
+#   "manual-node" / "manual-other" -> wir erzeugen die Basisdateien selbst
+#       (schnell, kein Netzwerk nötig)
+#   "npx" / "mix" -> wir rufen den offiziellen CLI-Generator auf (braucht
+#       Node/npm bzw. Elixir/mix, Internet beim ersten Mal, dauert etwas)
+#   "java-maven" / "java-gradle" -> wir erzeugen pom.xml/build.gradle +
+#       Main.java selbst, kein Netzwerk nötig (Maven/Gradle müssen für den
+#       späteren Build/Run selbst installiert sein, nicht fürs Anlegen)
 STACK_PRESETS = {
-    "Python / Flask": {
-        "kind": "manual-python",
+    "Flask (Web)": {
+        "kind": "python",
+        "template": "flask",
         "base_image": "python:3.12-slim",
         "run_cmd": "python app.py",
         "default_packages": ["flask"],
+    },
+    "FastAPI (Web/API)": {
+        "kind": "python",
+        "template": "fastapi",
+        "base_image": "python:3.12-slim",
+        "run_cmd": "uvicorn main:app --reload --host 0.0.0.0",
+        "default_packages": ["fastapi", "uvicorn[standard]"],
+    },
+    "Django (Web)": {
+        "kind": "python",
+        "template": "django",
+        "base_image": "python:3.12-slim",
+        "run_cmd": "python manage.py runserver 0.0.0.0:8000",
+        "default_packages": ["django"],
+    },
+    "Python CLI-Tool (Click)": {
+        "kind": "python",
+        "template": "cli",
+        "base_image": "python:3.12-slim",
+        "run_cmd": "python cli.py --help",
+        "default_packages": ["click"],
+    },
+    "Python-Paket (Library)": {
+        "kind": "python",
+        "template": "library",
+        "base_image": "python:3.12-slim",
+        "run_cmd": "pytest",
+        "default_packages": ["pytest"],
+    },
+    "Python Data Science (Jupyter)": {
+        "kind": "python",
+        "template": "jupyter",
+        "base_image": "python:3.12-slim",
+        "run_cmd": "jupyter lab --ip=0.0.0.0 --allow-root",
+        "default_packages": ["jupyterlab", "pandas", "numpy", "matplotlib"],
     },
     "Node": {
         "kind": "manual-node",
@@ -226,6 +268,25 @@ STACK_PRESETS = {
         "base_image": "node:22-slim",
         "scaffold_cmd": ["npx", "--yes", "@angular/cli@latest", "new", "{name}", "--skip-git", "--defaults"],
         "run_cmd": "npm start -- --host 0.0.0.0",
+        "default_packages": [],
+    },
+    "Java (Maven)": {
+        "kind": "java-maven",
+        "base_image": "maven:3.9-eclipse-temurin-21",
+        "run_cmd": "mvn -q compile exec:java",
+        "default_packages": [],
+    },
+    "Java (Gradle)": {
+        "kind": "java-gradle",
+        "base_image": "gradle:8-jdk21",
+        "run_cmd": "gradle run",
+        "default_packages": [],
+    },
+    "Phoenix (Elixir)": {
+        "kind": "mix",
+        "base_image": "elixir:1.17",
+        "scaffold_cmd": ["mix", "phx.new", "{name}", "--install"],
+        "run_cmd": "mix phx.server",
         "default_packages": [],
     },
     ".NET Web API": {
@@ -257,9 +318,20 @@ STACK_PRESETS = {
     },
 }
 
-# Nur Backend-Stacks bekommen die DB-Abfrage im Dialog angeboten —
-# bei React/Vue/Angular (Frontend) und "Sonstiges" ist das irrelevant.
-DB_RELEVANT_KINDS = {"manual-python", "manual-node", "dotnet"}
+def _db_packages_key(preset: dict) -> str:
+    """DB_PACKAGES-Schlüssel für ein Preset — bei kind == 'python' zählt
+    das jeweilige Template, weil Flask/FastAPI/Django unterschiedliche
+    DB-Pakete brauchen (andere ORMs), sonst reicht der kind."""
+    if preset["kind"] == "python":
+        return f"python-{preset['template']}"
+    return preset["kind"]
+
+
+# Nur Backend-Stacks bekommen die DB-Abfrage im Dialog angeboten — bei
+# React/Vue/Angular (Frontend), CLI/Library/Jupyter (kein Web-Backend),
+# Java/Phoenix (eigene DB-Konventionen, noch nicht verdrahtet) und
+# "Sonstiges" ist das irrelevant.
+DB_RELEVANT_PRESET_KEYS = {"python-flask", "python-fastapi", "python-django", "manual-node", "dotnet"}
 
 # SQLite bewusst NICHT hier drin — dateibasiert, braucht keinen eigenen
 # Container/Service, nur ein Paket (siehe DB_PACKAGES).
@@ -284,11 +356,23 @@ DB_SERVICE_PRESETS = {
 DB_CHOICES = ["Keine", "SQLite", "PostgreSQL", "MySQL", "SQL Server"]
 
 DB_PACKAGES = {
-    "manual-python": {
+    "python-flask": {
         "SQLite": ["flask-sqlalchemy"],
         "PostgreSQL": ["flask-sqlalchemy", "psycopg2-binary"],
         "MySQL": ["flask-sqlalchemy", "mysqlclient"],
         "SQL Server": ["flask-sqlalchemy", "pyodbc"],
+    },
+    "python-fastapi": {
+        "SQLite": ["sqlalchemy"],
+        "PostgreSQL": ["sqlalchemy", "psycopg2-binary"],
+        "MySQL": ["sqlalchemy", "mysqlclient"],
+        "SQL Server": ["sqlalchemy", "pyodbc"],
+    },
+    "python-django": {
+        "SQLite": [],  # Django hat SQLite eingebaut, kein Extra-Paket nötig
+        "PostgreSQL": ["psycopg2-binary"],
+        "MySQL": ["mysqlclient"],
+        "SQL Server": ["mssql-django", "pyodbc"],
     },
     "manual-node": {
         "SQLite": ["sqlite3"],
@@ -302,6 +386,17 @@ DB_PACKAGES = {
         "MySQL": ["Pomelo.EntityFrameworkCore.MySql"],
         "SQL Server": ["Microsoft.EntityFrameworkCore.SqlServer"],
     },
+}
+
+_PACKAGES_HINT = {
+    "python": "Zusätzliche pip-Pakete, eins pro Zeile",
+    "manual-node": "Zusätzliche npm-Pakete, eins pro Zeile",
+    "npx": "Zusätzliche npm-Pakete, eins pro Zeile (nach dem Scaffolding installiert)",
+    "dotnet": "Zusätzliche NuGet-Pakete, eins pro Zeile",
+    "java-maven": "Zusätzliche Maven-Abhängigkeiten, eine pro Zeile\nFormat: groupId:artifactId:version",
+    "java-gradle": "Zusätzliche Gradle-Abhängigkeiten, eine pro Zeile\nFormat: group:artifact:version",
+    "mix": "Phoenix verwaltet Abhängigkeiten selbst (mix.exs) — hier wird nichts installiert",
+    "manual-other": "Freitext-Notiz, landet in der README",
 }
 
 
@@ -397,17 +492,21 @@ class NewProjectDialog(QDialog):
         preset = STACK_PRESETS[stack]
         self.base_image_edit.setText(preset["base_image"])
         default_port = {
+            "Flask (Web)": 5000,
+            "Python Data Science (Jupyter)": 8888,
             "React (Vite)": 5173,
             "Vue (Vite)": 5173,
             "Angular": 4200,
             ".NET Web API": 5000,
             ".NET Razor Pages (Website)": 5000,
             ".NET MVC (Website)": 5000,
+            "Phoenix (Elixir)": 4000,
         }.get(stack, 8000)
         self.port_spin.setValue(default_port)
         self.packages_edit.setPlainText("\n".join(preset["default_packages"]))
+        self.packages_edit.setPlaceholderText(_PACKAGES_HINT.get(preset["kind"], "Zusätzliche Pakete, eins pro Zeile"))
 
-        db_relevant = preset["kind"] in DB_RELEVANT_KINDS
+        db_relevant = _db_packages_key(preset) in DB_RELEVANT_PRESET_KEYS
         self.db_label.setVisible(db_relevant)
         self.db_combo.setVisible(db_relevant)
         if not db_relevant:
@@ -658,6 +757,249 @@ def _patch_csproj_allow_missing_prune_data(project_dir: Path) -> None:
     csproj_path.write_text(content)
 
 
+# --------------------------------------------------------------------------
+# Python-Grundgerüste (echtes venv + pip install, dann Template-Dateien)
+# --------------------------------------------------------------------------
+
+_PYTHON_REQUIRED_PACKAGES = {
+    "flask": ["flask"],
+    "fastapi": ["fastapi", "uvicorn[standard]"],
+    "django": ["django"],
+    "cli": ["click"],
+    "jupyter": ["jupyterlab"],
+}
+
+
+def _scaffold_python(project_dir: Path, template: str, packages: list[str]) -> None:
+    # Nötige Pakete fürs Template IMMER sicherstellen, unabhängig davon ob
+    # der Nutzer sie aus dem vorbelegten Pakete-Feld rausgelöscht hat —
+    # sonst bricht z.B. django-admin unten mit "nicht gefunden" ab, ohne
+    # dass der Grund offensichtlich wäre.
+    merged = list(packages)
+    for pkg in _PYTHON_REQUIRED_PACKAGES.get(template, []):
+        if pkg not in merged:
+            merged.append(pkg)
+    packages = merged
+
+    project_dir.mkdir(parents=True)
+    (project_dir / "requirements.txt").write_text(
+        "\n".join(packages) + ("\n" if packages else "")
+    )
+
+    subprocess.run(
+        [sys.executable, "-m", "venv", "venv"], cwd=project_dir, check=True, capture_output=True,
+    )
+    venv_pip = project_dir / "venv" / "bin" / "pip"
+    if packages:
+        subprocess.run(
+            [str(venv_pip), "install", "--disable-pip-version-check", *packages],
+            cwd=project_dir, check=True, capture_output=True,
+        )
+
+    if template == "flask":
+        (project_dir / "app.py").write_text(
+            'from flask import Flask\n\n'
+            'app = Flask(__name__)\n\n\n'
+            '@app.route("/")\n'
+            'def index():\n'
+            '    return "Hallo aus Flask!"\n\n\n'
+            'if __name__ == "__main__":\n'
+            '    app.run(debug=True)\n'
+        )
+    elif template == "fastapi":
+        (project_dir / "main.py").write_text(
+            'from fastapi import FastAPI\n\n'
+            'app = FastAPI()\n\n\n'
+            '@app.get("/")\n'
+            'def read_root():\n'
+            '    return {"message": "Hallo aus FastAPI!"}\n'
+        )
+    elif template == "django":
+        safe_name = re.sub(r"\W", "_", project_dir.name) or "project"
+        if safe_name[0].isdigit():
+            safe_name = f"_{safe_name}"
+        subprocess.run(
+            [str(project_dir / "venv" / "bin" / "django-admin"), "startproject", safe_name, "."],
+            cwd=project_dir, check=True, capture_output=True,
+        )
+    elif template == "cli":
+        (project_dir / "cli.py").write_text(
+            'import click\n\n\n'
+            '@click.command()\n'
+            '@click.option("--name", default="Welt", help="Wen begrüßen?")\n'
+            'def main(name: str) -> None:\n'
+            '    click.echo(f"Hallo, {name}!")\n\n\n'
+            'if __name__ == "__main__":\n'
+            '    main()\n'
+        )
+    elif template == "library":
+        pkg_name = re.sub(r"\W", "_", project_dir.name).strip("_").lower() or "package"
+        src_dir = project_dir / "src" / pkg_name
+        src_dir.mkdir(parents=True)
+        (src_dir / "__init__.py").write_text(
+            f'"""{project_dir.name}."""\n\n__version__ = "0.1.0"\n'
+        )
+        tests_dir = project_dir / "tests"
+        tests_dir.mkdir()
+        (tests_dir / "test_basic.py").write_text(
+            f"from {pkg_name} import __version__\n\n\n"
+            "def test_version():\n"
+            '    assert __version__ == "0.1.0"\n'
+        )
+        (project_dir / "pyproject.toml").write_text(
+            "[build-system]\n"
+            'requires = ["setuptools>=68"]\n'
+            'build-backend = "setuptools.build_meta"\n\n'
+            "[project]\n"
+            f'name = "{pkg_name}"\n'
+            'version = "0.1.0"\n'
+            'requires-python = ">=3.10"\n\n'
+            "[tool.setuptools.packages.find]\n"
+            'where = ["src"]\n\n'
+            "[tool.pytest.ini_options]\n"
+            'pythonpath = ["src"]\n'  # sonst findet pytest das src-Layout-Paket nicht ohne editable install
+        )
+    elif template == "jupyter":
+        notebook = {
+            "cells": [
+                {
+                    "cell_type": "markdown",
+                    "metadata": {},
+                    "source": [f"# {project_dir.name}\n", "\n", "Start-Notebook."],
+                },
+                {
+                    "cell_type": "code",
+                    "execution_count": None,
+                    "metadata": {},
+                    "outputs": [],
+                    "source": ["import pandas as pd\n", "import numpy as np\n"],
+                },
+            ],
+            "metadata": {
+                "kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
+                "language_info": {"name": "python", "version": "3"},
+            },
+            "nbformat": 4,
+            "nbformat_minor": 5,
+        }
+        (project_dir / "analyse.ipynb").write_text(json.dumps(notebook, indent=2))
+    else:
+        raise ValueError(f"Unbekanntes Python-Template: {template}")
+
+
+# --------------------------------------------------------------------------
+# Java-Grundgerüste (pom.xml bzw. build.gradle + Main.java, kein Netzwerk
+# beim Anlegen nötig — Maven/Gradle selbst holen sich Abhängigkeiten
+# erst beim ersten Build)
+# --------------------------------------------------------------------------
+
+def _java_dependency_coords(packages: list[str]) -> list[tuple[str, str, str]]:
+    """Pakete im Format groupId:artifactId:version parsen, alles andere
+    (falsches Format) still ignorieren statt mit Traceback abzubrechen —
+    das Feld ist Freitext, Tippfehler sollen das Anlegen nicht zerschießen."""
+    coords = []
+    for pkg in packages:
+        parts = pkg.split(":")
+        if len(parts) == 3:
+            coords.append(tuple(parts))
+    return coords
+
+
+def _scaffold_java_maven(project_dir: Path, packages: list[str]) -> None:
+    project_dir.mkdir(parents=True)
+    src_main = project_dir / "src" / "main" / "java" / "com" / "example"
+    src_main.mkdir(parents=True)
+    (src_main / "Main.java").write_text(
+        "package com.example;\n\n"
+        "public class Main {\n"
+        "    public static void main(String[] args) {\n"
+        '        System.out.println("Hallo aus Java (Maven)!");\n'
+        "    }\n"
+        "}\n"
+    )
+
+    deps_xml = "\n".join(
+        f"        <dependency>\n"
+        f"            <groupId>{group}</groupId>\n"
+        f"            <artifactId>{artifact}</artifactId>\n"
+        f"            <version>{version}</version>\n"
+        f"        </dependency>"
+        for group, artifact, version in _java_dependency_coords(packages)
+    )
+    pom = f"""<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <groupId>com.example</groupId>
+    <artifactId>{project_dir.name}</artifactId>
+    <version>0.1.0</version>
+    <packaging>jar</packaging>
+
+    <properties>
+        <maven.compiler.source>21</maven.compiler.source>
+        <maven.compiler.target>21</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    </properties>
+
+    <dependencies>
+{deps_xml}
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+                <version>3.3.0</version>
+                <configuration>
+                    <mainClass>com.example.Main</mainClass>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+"""
+    (project_dir / "pom.xml").write_text(pom)
+
+
+def _scaffold_java_gradle(project_dir: Path, packages: list[str]) -> None:
+    project_dir.mkdir(parents=True)
+    src_main = project_dir / "src" / "main" / "java" / "com" / "example"
+    src_main.mkdir(parents=True)
+    (src_main / "Main.java").write_text(
+        "package com.example;\n\n"
+        "public class Main {\n"
+        "    public static void main(String[] args) {\n"
+        '        System.out.println("Hallo aus Java (Gradle)!");\n'
+        "    }\n"
+        "}\n"
+    )
+
+    deps_lines = "\n".join(
+        f"    implementation '{group}:{artifact}:{version}'"
+        for group, artifact, version in _java_dependency_coords(packages)
+    )
+    build_gradle = f"""plugins {{
+    id 'application'
+}}
+
+repositories {{
+    mavenCentral()
+}}
+
+dependencies {{
+{deps_lines}
+}}
+
+application {{
+    mainClass = 'com.example.Main'
+}}
+"""
+    (project_dir / "build.gradle").write_text(build_gradle)
+    (project_dir / "settings.gradle").write_text(f"rootProject.name = '{project_dir.name}'\n")
+
+
 def create_project(
     *,
     project_dir: Path,
@@ -676,23 +1018,22 @@ def create_project(
     # requirements.txt / package.json bzw. werden per `dotnet add` gezogen,
     # das passiert weiter unten mit der fertigen `packages`-Liste.
     if db != "Keine":
-        for pkg in DB_PACKAGES.get(kind, {}).get(db, []):
+        for pkg in DB_PACKAGES.get(_db_packages_key(preset), {}).get(db, []):
             if pkg not in packages:
                 packages.append(pkg)
 
     # --- Grundgerüst erzeugen -------------------------------------------
-    if kind == "manual-python":
-        project_dir.mkdir(parents=True)
-        (project_dir / "requirements.txt").write_text(
-            "\n".join(packages) + ("\n" if packages else "")
-        )
-        (project_dir / "app.py").write_text(
-            '"""Einstiegspunkt."""\n\n'
-            'def main() -> None:\n'
-            '    print("Hallo aus dem neuen Projekt!")\n\n\n'
-            'if __name__ == "__main__":\n'
-            '    main()\n'
-        )
+    if kind == "python":
+        _scaffold_python(project_dir, preset["template"], packages)
+    elif kind == "java-maven":
+        _scaffold_java_maven(project_dir, packages)
+    elif kind == "java-gradle":
+        _scaffold_java_gradle(project_dir, packages)
+    elif kind == "mix":
+        # mix phx.new legt den Ordner selbst an, wie npx/dotnet — NICHT
+        # vorher anlegen, sonst bricht der Generator ab.
+        cmd = [part.format(name=project_dir.name) for part in preset["scaffold_cmd"]]
+        subprocess.run(cmd, cwd=project_dir.parent, check=True, capture_output=True)
     elif kind == "manual-node":
         project_dir.mkdir(parents=True)
         package_json = {
@@ -741,12 +1082,18 @@ def create_project(
     # --- Docker ----------------------------------------------------------
     if use_docker:
         install_line = ""
-        if kind == "manual-python":
+        if kind == "python":
             install_line = "RUN pip install --no-cache-dir -r requirements.txt"
         elif kind in ("manual-node", "npx"):
             install_line = "RUN npm install"
         elif kind == "dotnet":
             install_line = "RUN dotnet restore"
+        elif kind == "java-maven":
+            install_line = "RUN mvn -q -B package -DskipTests"
+        elif kind == "java-gradle":
+            install_line = "RUN gradle build -x test"
+        elif kind == "mix":
+            install_line = "RUN mix deps.get && mix deps.compile"
 
         run_parts = preset["run_cmd"].split()
         cmd_json = ", ".join(f'"{part}"' for part in run_parts)
