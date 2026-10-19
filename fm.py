@@ -113,8 +113,256 @@ from PySide6.QtWidgets import (
 
 
 # --------------------------------------------------------------------------
-# Toggle-Switch (moderner iOS-Style Switch statt Radio-Buttons)
+# Design-System: dunkles, futuristisches Theme mit Cyan-Akzent. Ein
+# App-weites QSS (siehe main()) deckt die meisten Standard-Widgets ab;
+# die paar Stellen mit fest codierten Farben (Terminal, Flat-Header,
+# Breadcrumb-Links, Toggle-Switch) referenzieren dieselben Konstanten,
+# damit nichts aus dem Rahmen fällt.
 # --------------------------------------------------------------------------
+
+_BG = "#0b0f14"
+_PANEL = "#11161d"
+_PANEL_ALT = "#161c25"
+_BORDER = "#232b36"
+_TEXT = "#e6edf3"
+_TEXT_MUTED = "#7d8793"
+_ACCENT = "#2de2ff"
+_ACCENT_DIM = "#1aa8c4"
+_ACCENT_SOFT = "rgba(45, 226, 255, 40)"
+
+
+def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
+    h = hex_color.lstrip("#")
+    return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+
+
+APP_STYLESHEET = f"""
+QWidget {{
+    background-color: {_BG};
+    color: {_TEXT};
+    font-size: 13px;
+    selection-background-color: {_ACCENT};
+    selection-color: #04141a;
+}}
+
+QToolTip {{
+    background-color: {_PANEL_ALT};
+    color: {_TEXT};
+    border: 1px solid {_ACCENT_DIM};
+    padding: 4px 8px;
+    border-radius: 4px;
+}}
+
+QMenuBar {{
+    background-color: {_PANEL};
+    border-bottom: 1px solid {_BORDER};
+    padding: 2px;
+}}
+QMenuBar::item {{
+    background: transparent;
+    padding: 4px 10px;
+    border-radius: 4px;
+}}
+QMenuBar::item:selected {{
+    background-color: {_ACCENT_SOFT};
+    color: {_ACCENT};
+}}
+QMenu {{
+    background-color: {_PANEL_ALT};
+    border: 1px solid {_BORDER};
+    padding: 4px;
+    border-radius: 6px;
+}}
+QMenu::item {{
+    padding: 6px 24px 6px 12px;
+    border-radius: 4px;
+}}
+QMenu::item:selected {{
+    background-color: {_ACCENT_SOFT};
+    color: {_ACCENT};
+}}
+QMenu::separator {{
+    height: 1px;
+    background: {_BORDER};
+    margin: 4px 8px;
+}}
+
+QStatusBar {{
+    background-color: {_PANEL};
+    border-top: 1px solid {_BORDER};
+    color: {_TEXT_MUTED};
+}}
+
+QSplitter::handle {{
+    background-color: {_BORDER};
+}}
+QSplitter::handle:hover {{
+    background-color: {_ACCENT_DIM};
+}}
+QSplitter::handle:horizontal {{ width: 2px; }}
+QSplitter::handle:vertical {{ height: 2px; }}
+
+QTreeView, QListView, QTreeWidget, QListWidget {{
+    background-color: {_BG};
+    alternate-background-color: {_PANEL};
+    border: none;
+    outline: none;
+}}
+QTreeView::item, QListView::item, QTreeWidget::item, QListWidget::item {{
+    padding: 3px 4px;
+    border-radius: 3px;
+}}
+QTreeView::item:selected, QListView::item:selected,
+QTreeWidget::item:selected, QListWidget::item:selected {{
+    background-color: {_ACCENT_SOFT};
+    color: {_TEXT};
+    border: 1px solid {_ACCENT_DIM};
+}}
+QTreeView::item:hover, QListView::item:hover,
+QTreeWidget::item:hover, QListWidget::item:hover {{
+    background-color: {_PANEL_ALT};
+}}
+QHeaderView::section {{
+    background-color: {_PANEL};
+    color: {_TEXT_MUTED};
+    padding: 5px 6px;
+    border: none;
+    border-bottom: 1px solid {_BORDER};
+    border-right: 1px solid {_BORDER};
+}}
+QHeaderView::section:hover {{
+    color: {_ACCENT};
+}}
+
+QLineEdit, QPlainTextEdit, QComboBox, QSpinBox {{
+    background-color: {_PANEL};
+    border: 1px solid {_BORDER};
+    border-radius: 5px;
+    padding: 4px 8px;
+}}
+QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus, QSpinBox:focus {{
+    border: 1px solid {_ACCENT};
+}}
+QComboBox::drop-down {{
+    border: none;
+    width: 20px;
+}}
+QComboBox QAbstractItemView {{
+    background-color: {_PANEL_ALT};
+    border: 1px solid {_BORDER};
+    selection-background-color: {_ACCENT_SOFT};
+    selection-color: {_ACCENT};
+    outline: none;
+}}
+
+QPushButton, QToolButton {{
+    background-color: {_PANEL_ALT};
+    border: 1px solid {_BORDER};
+    border-radius: 5px;
+    padding: 5px 14px;
+}}
+QPushButton:hover, QToolButton:hover {{
+    border-color: {_ACCENT_DIM};
+    color: {_ACCENT};
+}}
+QPushButton:pressed, QToolButton:pressed {{
+    background-color: {_ACCENT_DIM};
+    color: #04141a;
+}}
+QPushButton:checked, QToolButton:checked {{
+    background-color: {_ACCENT_SOFT};
+    border-color: {_ACCENT};
+    color: {_ACCENT};
+}}
+QDialogButtonBox QPushButton {{
+    min-width: 80px;
+}}
+
+QTabBar::tab {{
+    background-color: {_PANEL};
+    color: {_TEXT_MUTED};
+    padding: 5px 14px;
+    border: 1px solid {_BORDER};
+    border-bottom: none;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+    margin-right: 2px;
+}}
+QTabBar::tab:selected {{
+    background-color: {_BG};
+    color: {_ACCENT};
+    border-bottom: 2px solid {_ACCENT};
+}}
+QTabBar::tab:hover {{
+    color: {_TEXT};
+}}
+
+QScrollBar:vertical {{
+    background: transparent;
+    width: 10px;
+    margin: 0;
+}}
+QScrollBar::handle:vertical {{
+    background: {_BORDER};
+    border-radius: 5px;
+    min-height: 24px;
+}}
+QScrollBar::handle:vertical:hover {{
+    background: {_ACCENT_DIM};
+}}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+QScrollBar:horizontal {{
+    background: transparent;
+    height: 10px;
+    margin: 0;
+}}
+QScrollBar::handle:horizontal {{
+    background: {_BORDER};
+    border-radius: 5px;
+    min-width: 24px;
+}}
+QScrollBar::handle:horizontal:hover {{
+    background: {_ACCENT_DIM};
+}}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
+
+QCheckBox::indicator {{
+    width: 15px;
+    height: 15px;
+    border: 1px solid {_BORDER};
+    border-radius: 3px;
+    background-color: {_PANEL};
+}}
+QCheckBox::indicator:checked {{
+    background-color: {_ACCENT};
+    border-color: {_ACCENT};
+}}
+
+QTableWidget {{
+    background-color: {_BG};
+    gridline-color: {_BORDER};
+    border: 1px solid {_BORDER};
+    border-radius: 4px;
+}}
+QTableWidget::item:selected {{
+    background-color: {_ACCENT_SOFT};
+    color: {_TEXT};
+}}
+
+QGroupBox {{
+    border: 1px solid {_BORDER};
+    border-radius: 6px;
+    margin-top: 10px;
+    padding-top: 6px;
+}}
+QGroupBox::title {{
+    color: {_ACCENT};
+    subcontrol-origin: margin;
+    left: 8px;
+    padding: 0 4px;
+}}
+"""
+
 
 class ToggleSwitch(QCheckBox):
     """QCheckBox, per Stylesheet als runder Toggle-Switch dargestellt.
@@ -125,19 +373,19 @@ class ToggleSwitch(QCheckBox):
         super().__init__(parent)
         self.setFixedSize(52, 28)
         self.setCursor(Qt.PointingHandCursor)
-        self.setStyleSheet("""
-            QCheckBox {
+        self.setStyleSheet(f"""
+            QCheckBox {{
                 spacing: 0px;
-            }
-            QCheckBox::indicator {
+            }}
+            QCheckBox::indicator {{
                 width: 52px;
                 height: 28px;
                 border-radius: 14px;
-                background-color: #555;
-            }
-            QCheckBox::indicator:checked {
-                background-color: #3daee9;
-            }
+                background-color: {_BORDER};
+            }}
+            QCheckBox::indicator:checked {{
+                background-color: {_ACCENT};
+            }}
         """)
 
 
@@ -1851,13 +2099,14 @@ class BreadcrumbBar(QWidget):
                 accum = accum / part
                 label_text = part
 
-            btn = QLabel(f"<a href='#' style='text-decoration:none;'>{label_text}</a>")
+            btn = QLabel(f"<a href='#' style='text-decoration:none; color:{_ACCENT};'>{label_text}</a>")
             btn.setTextInteractionFlags(Qt.TextBrowserInteraction)
             btn.linkActivated.connect(lambda _, p=accum: self._on_navigate(p))
             self._crumb_layout.addWidget(btn)
 
             if i < len(parts) - 1:
                 sep = QLabel(" / ")
+                sep.setStyleSheet(f"color: {_TEXT_MUTED};")
                 self._crumb_layout.addWidget(sep)
 
     def focus_edit(self) -> None:
@@ -3043,10 +3292,11 @@ class TerminalWidget(QWidget):
         self._cell_h = max(1, metrics.height())
         self._ascent = metrics.ascent()
 
-        self._bg_rgb = (30, 30, 30)
-        self._fg_rgb = (220, 220, 220)
+        self._bg_rgb = _hex_to_rgb(_BG)
+        self._fg_rgb = _hex_to_rgb(_TEXT)
         self._bg_color = QColor(*self._bg_rgb)
-        self._cursor_color = QColor(255, 255, 255, 140)
+        self._cursor_color = QColor(_ACCENT)
+        self._cursor_color.setAlpha(150)
 
         self.screen = pyte.HistoryScreen(80, 24, history=4000, ratio=0.5)
         self.stream = pyte.Stream(self.screen)
@@ -3239,21 +3489,21 @@ class TerminalWidget(QWidget):
         painter.end()
 
 
-_FLAT_HEADER_BG = "background-color: #262626;"
-_FLAT_TITLE_STYLE = "color: #888888; font-size: 11px;"
-_FLAT_BUTTON_STYLE = """
-    QToolButton {
-        color: #999999;
+_FLAT_HEADER_BG = f"background-color: {_PANEL};"
+_FLAT_TITLE_STYLE = f"color: {_TEXT_MUTED}; font-size: 11px; font-weight: 600; letter-spacing: 0.5px;"
+_FLAT_BUTTON_STYLE = f"""
+    QToolButton {{
+        color: {_TEXT_MUTED};
         font-size: 11px;
         border: none;
         background: transparent;
         padding: 2px 6px;
-    }
-    QToolButton:hover {
-        color: #eeeeee;
-        background: #3a3a3a;
+    }}
+    QToolButton:hover {{
+        color: {_ACCENT};
+        background: {_PANEL_ALT};
         border-radius: 3px;
-    }
+    }}
 """
 
 
@@ -3484,6 +3734,8 @@ def main() -> None:
     start = Path(sys.argv[1]).expanduser() if len(sys.argv) > 1 else Path.home()
     app = QApplication(sys.argv)
     app.setApplicationName("fm")
+    app.setStyle("Fusion")  # einheitliche Basis plattformübergreifend, QSS baut direkt darauf auf
+    app.setStyleSheet(APP_STYLESHEET)
     window = MainWindow(start)
     window.show()
     sys.exit(app.exec())
