@@ -82,6 +82,7 @@ from PySide6.QtWidgets import (
     QFileIconProvider,
     QFileSystemModel,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
@@ -96,6 +97,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QStackedWidget,
@@ -401,6 +403,12 @@ class TargetDirSwitch(QWidget):
         self.here_path = here_path
         self.dev_path = dev_path
 
+        # Ohne das blähte QFormLayout diese Zeile in der Praxis auf ~330px
+        # Höhe auf (sizeHint() meldet korrekt 28px, aber im Zusammenspiel
+        # mit den Nachbar-Feldern im echten Dialog griff Qt trotzdem auf
+        # vertikales Wachstum zurück) — Fixed erzwingt die sizeHint-Höhe.
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+
         self.label_here = QLabel("Hier")
         self.label_dev = QLabel("In ~/Dev")
         self.switch = ToggleSwitch(self)
@@ -658,7 +666,10 @@ class NewProjectDialog(QDialog):
         self.current_pane_dir = current_pane_dir
         self.dev_dir = Path.home() / "Dev"
         self.setWindowTitle("Neues Projekt anlegen")
-        self.resize(580, 660)
+        self.setMinimumWidth(480)
+        # Bewusst KEIN resize() auf eine feste Höhe — QFormLayout verteilt
+        # überschüssigen Platz sonst als Lücken zwischen die Zeilen statt
+        # ihn ungenutzt zu lassen. Die natürliche sizeHint-Höhe reicht.
 
         self.name_edit = QLineEdit(self)
         self.name_edit.setPlaceholderText("z.B. mein-neues-projekt")
@@ -679,10 +690,13 @@ class NewProjectDialog(QDialog):
         self.db_combo = QComboBox(self)
         self.db_combo.addItems(DB_CHOICES)
 
-        self.docker_checkbox = QCheckBox(
-            "Projekt soll selbst in Docker laufen (nicht nur Dev-Container)", self
-        )
-        self.docker_checkbox.toggled.connect(self._on_docker_toggled)
+        project_group = QGroupBox("Projekt", self)
+        project_form = QFormLayout(project_group)
+        project_form.addRow("Projektname:", self.name_edit)
+        project_form.addRow("Zielordner:", self.target_switch)
+        project_form.addRow("Stack:", self.stack_combo)
+        project_form.addRow("Pakete:", self.packages_edit)
+        project_form.addRow(self.db_label, self.db_combo)
 
         self.base_image_edit = QLineEdit(self)
         self.port_spin = QSpinBox(self)
@@ -691,6 +705,7 @@ class NewProjectDialog(QDialog):
         self.env_table = QTableWidget(0, 2, self)
         self.env_table.setHorizontalHeaderLabels(["Variable", "Wert"])
         self.env_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.env_table.setFixedHeight(90)
 
         add_env_btn = QPushButton("+ Env-Var", self)
         add_env_btn.clicked.connect(self._add_env_row)
@@ -705,10 +720,33 @@ class NewProjectDialog(QDialog):
         self.open_vscode_checkbox = QCheckBox("Nach dem Erstellen in VS Code öffnen", self)
         self.open_vscode_checkbox.setChecked(True)
 
-        self.docker_fields_widget = QWidget(self)
-        docker_form = QFormLayout(self.docker_fields_widget)
+        # Checkbare GroupBox statt separater Checkbox-Zeile + Extra-Widget:
+        # Der Haken im Titel ersetzt docker_checkbox, der Inhalt klappt
+        # per toggled() komplett ein/aus statt nur ausgegraut zu werden —
+        # kompakter, wenn Docker nicht gebraucht wird (der Normalfall).
+        self.docker_group = QGroupBox("Docker", self)
+        self.docker_group.setCheckable(True)
+        self.docker_group.setChecked(False)
+        self.docker_group.setToolTip(
+            "Projekt soll selbst in Docker laufen (nicht nur Dev-Container)"
+        )
+
+        docker_content = QWidget(self.docker_group)
+        self._docker_content = docker_content
+        docker_content_layout = QVBoxLayout(docker_content)
+        docker_content_layout.setContentsMargins(0, 6, 0, 0)
+        docker_form = QFormLayout()
         docker_form.addRow("Base-Image:", self.base_image_edit)
         docker_form.addRow("Port:", self.port_spin)
+        docker_content_layout.addLayout(docker_form)
+        docker_content_layout.addWidget(QLabel("Umgebungsvariablen:"))
+        docker_content_layout.addWidget(self.env_table)
+        docker_content_layout.addLayout(env_btn_row)
+
+        docker_group_layout = QVBoxLayout(self.docker_group)
+        docker_group_layout.addWidget(docker_content)
+        self.docker_group.toggled.connect(docker_content.setVisible)
+        docker_content.setVisible(False)
 
         self.buttons = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self
@@ -718,23 +756,13 @@ class NewProjectDialog(QDialog):
         self.buttons.rejected.connect(self.reject)
 
         layout = QVBoxLayout(self)
-        form = QFormLayout()
-        form.addRow("Projektname:", self.name_edit)
-        form.addRow("Zielordner:", self.target_switch)
-        form.addRow("Stack:", self.stack_combo)
-        form.addRow("Pakete:", self.packages_edit)
-        form.addRow(self.db_label, self.db_combo)
-        layout.addLayout(form)
-        layout.addWidget(self.docker_checkbox)
-        layout.addWidget(self.docker_fields_widget)
-        layout.addWidget(QLabel("Umgebungsvariablen:"))
-        layout.addWidget(self.env_table)
-        layout.addLayout(env_btn_row)
+        layout.setSpacing(10)
+        layout.addWidget(project_group)
+        layout.addWidget(self.docker_group)
         layout.addWidget(self.open_vscode_checkbox)
         layout.addWidget(self.buttons)
 
         self._on_stack_changed(self.stack_combo.currentText())
-        self._on_docker_toggled(False)
 
     def _on_stack_changed(self, stack: str) -> None:
         preset = STACK_PRESETS[stack]
@@ -759,10 +787,6 @@ class NewProjectDialog(QDialog):
         self.db_combo.setVisible(db_relevant)
         if not db_relevant:
             self.db_combo.setCurrentText("Keine")
-
-    def _on_docker_toggled(self, checked: bool) -> None:
-        self.docker_fields_widget.setVisible(checked)
-        self.env_table.setVisible(checked)
 
     def _add_env_row(self) -> None:
         row = self.env_table.rowCount()
@@ -803,7 +827,7 @@ class NewProjectDialog(QDialog):
         packages = [
             p.strip() for p in self.packages_edit.toPlainText().splitlines() if p.strip()
         ]
-        use_docker = self.docker_checkbox.isChecked()
+        use_docker = self.docker_group.isChecked()
         base_image = self.base_image_edit.text().strip() or STACK_PRESETS[stack]["base_image"]
         port = self.port_spin.value()
         env_vars = self._collect_env_vars() if use_docker else {}
