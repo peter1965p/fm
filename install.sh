@@ -32,7 +32,29 @@ Exec=$REPO_DIR/fm %f
 Icon=system-file-manager
 Terminal=false
 Categories=System;FileTools;FileManager;
+MimeType=inode/directory;
 EOF
+
+# Als Standard-Dateimanager einrichten (ersetzt z.B. Dolphin/Nautilus beim
+# Öffnen von Ordnern) — nur interaktiv fragen, nicht bei automatisierten
+# Läufen (kein Terminal an stdin) ungefragt umstellen.
+if command -v xdg-mime >/dev/null && [ -t 0 ]; then
+    CURRENT_DEFAULT=$(xdg-mime query default inode/directory 2>/dev/null || true)
+    if [ "$CURRENT_DEFAULT" != "fm.desktop" ]; then
+        read -r -p "fm als Standard-Dateimanager einrichten (ersetzt aktuell: ${CURRENT_DEFAULT:-keinen})? [j/N] " ANSWER
+        case "$ANSWER" in
+            [jJ]*)
+                mkdir -p "$HOME/.config/fm"
+                [ -n "$CURRENT_DEFAULT" ] && echo "$CURRENT_DEFAULT" > "$HOME/.config/fm/previous-default-filemanager"
+                xdg-mime default fm.desktop inode/directory
+                echo "fm ist jetzt Standard-Dateimanager (rückgängig: uninstall.sh oder xdg-mime default ${CURRENT_DEFAULT:-<altes .desktop>} inode/directory)."
+                ;;
+            *)
+                echo "Standard-Dateimanager unverändert."
+                ;;
+        esac
+    fi
+fi
 
 if command -v git >/dev/null; then
     mkdir -p "$HOME/.config/systemd/user"
