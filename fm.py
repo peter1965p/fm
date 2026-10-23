@@ -2605,6 +2605,45 @@ class SearchDialog(QDialog):
 # Lesezeichen — persistente Liste in ~/.config/fm/bookmarks.json
 # --------------------------------------------------------------------------
 
+USER_DIRS_FILE = Path.home() / ".config" / "user-dirs.dirs"
+
+_XDG_DIR_LABELS = [
+    ("XDG_DESKTOP_DIR", "Schreibtisch"),
+    ("XDG_DOCUMENTS_DIR", "Dokumente"),
+    ("XDG_DOWNLOAD_DIR", "Downloads"),
+    ("XDG_MUSIC_DIR", "Musik"),
+    ("XDG_PICTURES_DIR", "Bilder"),
+    ("XDG_VIDEOS_DIR", "Videos"),
+]
+
+
+def list_standard_folders() -> list[tuple[str, Path]]:
+    """(Anzeigename, Pfad) für Home + die über xdg-user-dirs konfigurierten
+    Standardordner — wie bei Dolphin/Nautilus oben in der Orte-Leiste.
+    Namen kommen aus ~/.config/user-dirs.dirs (lokalisiert, z.B.
+    'Dokumente' statt 'Documents'); nicht vorhandene Ordner werden
+    ausgelassen statt einen toten Eintrag anzuzeigen."""
+    folders = [("Persönlicher Ordner", Path.home())]
+
+    values: dict[str, str] = {}
+    if USER_DIRS_FILE.is_file():
+        for line in USER_DIRS_FILE.read_text().splitlines():
+            line = line.strip()
+            if not line.startswith("XDG_") or "=" not in line:
+                continue
+            key, _, raw_value = line.partition("=")
+            value = raw_value.strip().strip('"').replace("$HOME", str(Path.home()))
+            values[key.strip()] = value
+
+    for key, label in _XDG_DIR_LABELS:
+        raw = values.get(key)
+        if raw:
+            path = Path(raw)
+            if path.is_dir():
+                folders.append((label, path))
+    return folders
+
+
 BOOKMARKS_FILE = Path.home() / ".config" / "fm" / "bookmarks.json"
 
 
@@ -2711,8 +2750,16 @@ def find_gvfs_mount(prefix: str) -> Path | None:
 # normal durchsuchbaren Ordner mounten.
 # --------------------------------------------------------------------------
 
-def list_rclone_drive_remotes() -> list[str]:
-    """Namen der konfigurierten rclone-Remotes vom Typ 'drive'."""
+# rclone-Backend-Typ -> Anzeigename in der Cloud-Sektion. Google Drive und
+# Google Fotos sind bei Google zwei komplett getrennte Dienste mit eigener
+# API/eigenem OAuth — rclone bildet das als zwei verschiedene Remote-Typen
+# ab, fm zeigt entsprechend zwei getrennte Orte.
+_RCLONE_CLOUD_TYPES = {"drive": "Google Drive", "gphotos": "Google Fotos"}
+
+
+def list_rclone_cloud_remotes() -> list[tuple[str, str, str]]:
+    """(Remote-Name, Backend-Typ, Anzeigename) je konfiguriertem rclone-
+    Remote, dessen Typ fm kennt (aktuell Drive und Google Fotos)."""
     if shutil.which("rclone") is None:
         return []
     try:
@@ -2726,8 +2773,8 @@ def list_rclone_drive_remotes() -> list[str]:
     remotes = []
     for line in result.stdout.splitlines():
         parts = line.split()
-        if len(parts) == 2 and parts[1] == "drive":
-            remotes.append(parts[0].rstrip(":"))
+        if len(parts) == 2 and parts[1] in _RCLONE_CLOUD_TYPES:
+            remotes.append((parts[0].rstrip(":"), parts[1], _RCLONE_CLOUD_TYPES[parts[1]]))
     return remotes
 
 
@@ -2772,6 +2819,52 @@ def ensure_rclone_service(remote: str) -> None:
     service_path = service_dir / rclone_service_name(remote)
     if not service_path.is_file() or service_path.read_text() != content:
         service_path.write_text(content)
+        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True, timeout=10)
+
+
+# Google Fotos eignet sich schlecht für einen Live-Mount (Auflisten ist
+# bei größeren Bibliotheken sehr langsam, teils minutenlang) — stattdessen
+# echte lokale Kopie per rclone copy (nie löschend, nur hinzufügen/
+# aktualisieren) nach ~/Bilder/Google Fotos, täglich per Timer aufgefrischt,
+# genau wie beim fm-update-Timer.
+
+def rclone_sync_target_dir() -> Path:
+    return Path.home() / "Bilder" / "Google Fotos"
+
+
+def rclone_sync_service_name(remote: str) -> str:
+    return f"fm-rclone-sync-{remote}.service"
+
+
+def rclone_sync_timer_name(remote: str) -> str:
+    return f"fm-rclone-sync-{remote}.timer"
+
+
+def ensure_rclone_sync_service(remote: str, source_subpath: str, target_dir: Path) -> None:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    service_dir = Path.home() / ".config" / "systemd" / "user"
+    service_dir.mkdir(parents=True, exist_ok=True)
+    rclone_bin = shutil.which("rclone") or "/usr/bin/rclone"
+    service_content = (
+        f"[Unit]\nDescription=fm — rclone-Sync {remote}:{source_subpath} nach {target_dir}\n\n"
+        f"[Service]\nType=oneshot\n"
+        f'ExecStart={rclone_bin} copy "{remote}:{source_subpath}" "{target_dir}" --create-empty-src-dirs\n'
+    )
+    timer_content = (
+        f"[Unit]\nDescription=Zeitplan für fm-rclone-Sync {remote}\n\n"
+        f"[Timer]\nOnCalendar=daily\nPersistent=true\n\n"
+        f"[Install]\nWantedBy=default.target\n"
+    )
+    service_path = service_dir / rclone_sync_service_name(remote)
+    timer_path = service_dir / rclone_sync_timer_name(remote)
+    changed = False
+    if not service_path.is_file() or service_path.read_text() != service_content:
+        service_path.write_text(service_content)
+        changed = True
+    if not timer_path.is_file() or timer_path.read_text() != timer_content:
+        timer_path.write_text(timer_content)
+        changed = True
+    if changed:
         subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True, timeout=10)
 
 
@@ -2852,6 +2945,7 @@ class BookmarksPanel(QWidget):
     Drive via GNOME Online Accounts). Favoriten persistieren nach
     ~/.config/fm/bookmarks.json, der Rest wird live abgefragt."""
 
+    SECTION_FOLDERS = "Ordner"
     SECTION_FAVORITES = "Favoriten"
     SECTION_DRIVES = "Laufwerke"
     SECTION_NETWORK = "Netzwerk"
@@ -2900,7 +2994,7 @@ class BookmarksPanel(QWidget):
         layout.addWidget(self.tree)
 
         self._sections: dict[str, QTreeWidgetItem] = {}
-        for name in (self.SECTION_FAVORITES, self.SECTION_DRIVES, self.SECTION_NETWORK, self.SECTION_CLOUD):
+        for name in (self.SECTION_FOLDERS, self.SECTION_FAVORITES, self.SECTION_DRIVES, self.SECTION_NETWORK, self.SECTION_CLOUD):
             section_item = QTreeWidgetItem([name])
             section_item.setFlags(Qt.ItemIsEnabled)  # Header: nicht klickbar/selektierbar als Ort
             font = section_item.font(0)
@@ -2914,10 +3008,24 @@ class BookmarksPanel(QWidget):
         self.refresh_all()
 
     def refresh_all(self) -> None:
+        self._refresh_folders()
         self._refresh_favorites()
         self._refresh_drives()
         self._refresh_network()
         self._refresh_cloud()
+
+    # ----------------------------------------------------------------
+    # Ordner (Home + XDG-Standardordner: Schreibtisch/Dokumente/...)
+    # ----------------------------------------------------------------
+
+    def _refresh_folders(self) -> None:
+        section = self._sections[self.SECTION_FOLDERS]
+        section.takeChildren()
+        for label, path in list_standard_folders():
+            item = QTreeWidgetItem([label])
+            item.setToolTip(0, str(path))
+            item.setData(0, Qt.UserRole, {"kind": "path", "path": str(path)})
+            section.addChild(item)
 
     # ----------------------------------------------------------------
     # Favoriten
@@ -3040,11 +3148,18 @@ class BookmarksPanel(QWidget):
         section.takeChildren()
         any_entries = False
 
-        for remote in list_rclone_drive_remotes():
-            mounted = rclone_is_mounted(remote)
-            label = f"Google Drive — {remote} (rclone){' ●' if mounted else ''}"
+        for remote, backend_type, display_name in list_rclone_cloud_remotes():
+            if backend_type == "gphotos":
+                # Google Fotos: kein Live-Mount (Auflisten ist zu langsam),
+                # stattdessen echte lokale Kopie nach ~/Bilder/Google Fotos.
+                label = f"{display_name} — {remote} (rclone, Sync nach Bilder)"
+                action_data = {"kind": "action", "action": "open_rclone_sync", "remote": remote}
+            else:
+                mounted = rclone_is_mounted(remote)
+                label = f"{display_name} — {remote} (rclone){' ●' if mounted else ''}"
+                action_data = {"kind": "action", "action": "open_rclone", "remote": remote}
             item = QTreeWidgetItem([label])
-            item.setData(0, Qt.UserRole, {"kind": "action", "action": "open_rclone", "remote": remote})
+            item.setData(0, Qt.UserRole, action_data)
             section.addChild(item)
             any_entries = True
 
@@ -3164,6 +3279,23 @@ class BookmarksPanel(QWidget):
         )
         self._refresh_cloud()
 
+    def _open_rclone_sync(self, remote: str) -> None:
+        target_dir = rclone_sync_target_dir()
+        ensure_rclone_sync_service(remote, "media/all", target_dir)
+        # Timer aktivieren (täglich neu synchronisieren) UND den ersten
+        # Lauf sofort anstoßen — --no-block, weil ein Oneshot-Service
+        # sonst den Aufrufer bis zum fertigen Durchlauf blockiert, bei
+        # einer großen Fotobibliothek potenziell sehr lange.
+        subprocess.run(
+            ["systemctl", "--user", "enable", "--now", rclone_sync_timer_name(remote)],
+            capture_output=True, timeout=15,
+        )
+        subprocess.run(
+            ["systemctl", "--user", "start", "--no-block", rclone_sync_service_name(remote)],
+            capture_output=True, timeout=15,
+        )
+        self.navigate_callback(target_dir)
+
     # ----------------------------------------------------------------
     # Gemeinsame Klick-/Kontextmenü-Behandlung
     # ----------------------------------------------------------------
@@ -3186,6 +3318,8 @@ class BookmarksPanel(QWidget):
                 self._open_google(data["account_id"])
             elif action == "open_rclone":
                 self._open_rclone(data["remote"])
+            elif action == "open_rclone_sync":
+                self._open_rclone_sync(data["remote"])
 
     def _show_context_menu(self, pos) -> None:
         item = self.tree.itemAt(pos)
