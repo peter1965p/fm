@@ -40,6 +40,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import termios
 import zipfile
 from datetime import datetime
@@ -2701,6 +2702,78 @@ def find_gvfs_mount(prefix: str) -> Path | None:
     return None
 
 
+# --------------------------------------------------------------------------
+# rclone — Alternative zu GOA/gvfs-goa für Google Drive: Google hat den
+# breiten Drive-Dateizugriff auf verifizierte OAuth-Apps beschränkt, GNOME
+# Online Accounts bekommt dafür praktisch keinen Zugriff mehr (nur noch
+# Mail/Kalender/Kontakte/Aufgaben). rclone bringt einen eigenen, von Google
+# noch akzeptierten Client mit und kann per FUSE einen echten, für fm ganz
+# normal durchsuchbaren Ordner mounten.
+# --------------------------------------------------------------------------
+
+def list_rclone_drive_remotes() -> list[str]:
+    """Namen der konfigurierten rclone-Remotes vom Typ 'drive'."""
+    if shutil.which("rclone") is None:
+        return []
+    try:
+        result = subprocess.run(
+            ["rclone", "listremotes", "--long"], capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+    if result.returncode != 0:
+        return []
+    remotes = []
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1] == "drive":
+            remotes.append(parts[0].rstrip(":"))
+    return remotes
+
+
+def rclone_mount_dir(remote: str) -> Path:
+    return Path.home() / ".local" / "share" / "fm" / "rclone" / remote
+
+
+def rclone_service_name(remote: str) -> str:
+    return f"fm-rclone-{remote}.service"
+
+
+def rclone_is_mounted(remote: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["findmnt", str(rclone_mount_dir(remote))], capture_output=True, text=True, timeout=5,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+    return result.returncode == 0
+
+
+def ensure_rclone_service(remote: str) -> None:
+    """Legt (bzw. erneuert) den systemd --user Service für diesen Remote an.
+    WICHTIG: der eigentliche Mount läuft über systemd --user, NICHT direkt
+    als Kindprozess von fm — ein per fusermount3 (setuid) gemounteter FUSE-
+    Mount braucht Rechte, die ein durch no_new_privs beschränkter Prozess-
+    baum nicht weitergeben kann. systemd --user ist davon unabhängig."""
+    mount_dir = rclone_mount_dir(remote)
+    mount_dir.mkdir(parents=True, exist_ok=True)
+    service_dir = Path.home() / ".config" / "systemd" / "user"
+    service_dir.mkdir(parents=True, exist_ok=True)
+    rclone_bin = shutil.which("rclone") or "/usr/bin/rclone"
+    fusermount_bin = shutil.which("fusermount3") or shutil.which("fusermount") or "/usr/bin/fusermount3"
+    content = (
+        f"[Unit]\nDescription=fm — rclone-Mount für {remote}\n\n"
+        f"[Service]\nType=simple\n"
+        f"ExecStart={rclone_bin} mount {remote}: {mount_dir} --vfs-cache-mode writes\n"
+        f"ExecStop={fusermount_bin} -u {mount_dir}\n"
+        f"Restart=on-failure\nRestartSec=5\n"
+    )
+    service_path = service_dir / rclone_service_name(remote)
+    if not service_path.is_file() or service_path.read_text() != content:
+        service_path.write_text(content)
+        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True, timeout=10)
+
+
 def humanize_gvfs_name(name: str) -> str:
     """'smb-share:server=X,share=Y' -> 'SMB — X/Y', für eine lesbare
     Beschriftung in der Orte-Leiste statt des rohen GVFS-Verzeichnisnamens."""
@@ -2964,15 +3037,25 @@ class BookmarksPanel(QWidget):
     def _refresh_cloud(self) -> None:
         section = self._sections[self.SECTION_CLOUD]
         section.takeChildren()
-        accounts = list_google_accounts()
-        if not accounts:
+        any_entries = False
+
+        for remote in list_rclone_drive_remotes():
+            mounted = rclone_is_mounted(remote)
+            label = f"Google Drive — {remote} (rclone){' ●' if mounted else ''}"
+            item = QTreeWidgetItem([label])
+            item.setData(0, Qt.UserRole, {"kind": "action", "action": "open_rclone", "remote": remote})
+            section.addChild(item)
+            any_entries = True
+
+        for account_id, label in list_google_accounts():
+            item = QTreeWidgetItem([f"Google Drive — {label} (GOA, nur falls freigegeben)"])
+            item.setData(0, Qt.UserRole, {"kind": "action", "action": "open_google", "account_id": account_id})
+            section.addChild(item)
+            any_entries = True
+
+        if not any_entries:
             item = QTreeWidgetItem(["+ Google Drive verbinden …"])
             item.setData(0, Qt.UserRole, {"kind": "action", "action": "connect_google"})
-            section.addChild(item)
-            return
-        for account_id, label in accounts:
-            item = QTreeWidgetItem([f"Google Drive ({label})"])
-            item.setData(0, Qt.UserRole, {"kind": "action", "action": "open_google", "account_id": account_id})
             section.addChild(item)
 
     def _connect_google(self) -> None:
@@ -3017,6 +3100,41 @@ class BookmarksPanel(QWidget):
         else:
             QMessageBox.warning(self, "Nicht gefunden", "Google Drive konnte nicht gemountet werden.")
 
+    def _open_rclone(self, remote: str) -> None:
+        mount_dir = rclone_mount_dir(remote)
+        if not rclone_is_mounted(remote):
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            ensure_rclone_service(remote)
+            subprocess.run(
+                ["systemctl", "--user", "start", rclone_service_name(remote)],
+                capture_output=True, timeout=15,
+            )
+            # Mount läuft asynchron als eigener systemd-Dienst an — kurz
+            # pollen statt sofort aufzugeben, OAuth-Token-Refresh übers
+            # Netz dauert typischerweise 1-2s.
+            for _ in range(15):
+                if rclone_is_mounted(remote):
+                    break
+                QApplication.processEvents()
+                time.sleep(0.2)
+            QApplication.restoreOverrideCursor()
+            self._refresh_cloud()
+        if rclone_is_mounted(remote) or mount_dir.is_dir():
+            self.navigate_callback(mount_dir)
+        else:
+            QMessageBox.warning(
+                self, "Mount fehlgeschlagen",
+                f"Konnte {remote}: nicht mounten. Details: "
+                f"journalctl --user -u {rclone_service_name(remote)}",
+            )
+
+    def _disconnect_rclone(self, remote: str) -> None:
+        subprocess.run(
+            ["systemctl", "--user", "stop", rclone_service_name(remote)],
+            capture_output=True, timeout=15,
+        )
+        self._refresh_cloud()
+
     # ----------------------------------------------------------------
     # Gemeinsame Klick-/Kontextmenü-Behandlung
     # ----------------------------------------------------------------
@@ -3037,6 +3155,8 @@ class BookmarksPanel(QWidget):
                 self._connect_google()
             elif action == "open_google":
                 self._open_google(data["account_id"])
+            elif action == "open_rclone":
+                self._open_rclone(data["remote"])
 
     def _show_context_menu(self, pos) -> None:
         item = self.tree.itemAt(pos)
@@ -3053,6 +3173,8 @@ class BookmarksPanel(QWidget):
             menu.addAction("Aushängen", lambda: self._unmount_drive(data.get("device", "")))
         elif section_name == self.SECTION_NETWORK and data["kind"] == "path":
             menu.addAction("Trennen", lambda: self._unmount_gio_path(Path(data["path"])))
+        elif section_name == self.SECTION_CLOUD and data.get("action") == "open_rclone":
+            menu.addAction("Trennen", lambda: self._disconnect_rclone(data["remote"]))
         if not menu.isEmpty():
             menu.exec(self.tree.viewport().mapToGlobal(pos))
 
