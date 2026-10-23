@@ -2766,7 +2766,8 @@ def ensure_rclone_service(remote: str) -> None:
         f"[Service]\nType=simple\n"
         f"ExecStart={rclone_bin} mount {remote}: {mount_dir} --vfs-cache-mode writes\n"
         f"ExecStop={fusermount_bin} -u {mount_dir}\n"
-        f"Restart=on-failure\nRestartSec=5\n"
+        f"Restart=on-failure\nRestartSec=5\n\n"
+        f"[Install]\nWantedBy=default.target\n"
     )
     service_path = service_dir / rclone_service_name(remote)
     if not service_path.is_file() or service_path.read_text() != content:
@@ -3102,35 +3103,63 @@ class BookmarksPanel(QWidget):
 
     def _open_rclone(self, remote: str) -> None:
         mount_dir = rclone_mount_dir(remote)
-        if not rclone_is_mounted(remote):
-            QApplication.setOverrideCursor(Qt.WaitCursor)
+        was_mounted = rclone_is_mounted(remote)
+        if not was_mounted:
             ensure_rclone_service(remote)
+            # enable, nicht nur start: der Mount wird damit ein dauerhafter
+            # Systemdienst, der automatisch bei der Anmeldung kommt — nicht
+            # nur etwas, das fm bei Bedarf wegklickt-mountet.
             subprocess.run(
-                ["systemctl", "--user", "start", rclone_service_name(remote)],
+                ["systemctl", "--user", "enable", "--now", rclone_service_name(remote)],
                 capture_output=True, timeout=15,
             )
-            # Mount läuft asynchron als eigener systemd-Dienst an — kurz
-            # pollen statt sofort aufzugeben, OAuth-Token-Refresh übers
-            # Netz dauert typischerweise 1-2s.
-            for _ in range(15):
-                if rclone_is_mounted(remote):
-                    break
-                QApplication.processEvents()
-                time.sleep(0.2)
-            QApplication.restoreOverrideCursor()
             self._refresh_cloud()
-        if rclone_is_mounted(remote) or mount_dir.is_dir():
-            self.navigate_callback(mount_dir)
-        else:
-            QMessageBox.warning(
-                self, "Mount fehlgeschlagen",
-                f"Konnte {remote}: nicht mounten. Details: "
-                f"journalctl --user -u {rclone_service_name(remote)}",
+            # Harte Fehlschläge (z.B. rclone-Binary fehlt) zeigen sich sofort
+            # im Service-Status — das lohnt sich, unmittelbar zu prüfen,
+            # statt den Nutzer 45s auf ein leeres Verzeichnis starren zu
+            # lassen. Eine lange Google-Listing-Zeit dagegen ist normal und
+            # kein Fehler, dafür ist der Poller unten da.
+            time.sleep(0.5)
+            status = subprocess.run(
+                ["systemctl", "--user", "is-active", rclone_service_name(remote)],
+                capture_output=True, text=True, timeout=10,
             )
+            if status.stdout.strip() == "failed":
+                QMessageBox.warning(
+                    self, "Mount fehlgeschlagen",
+                    f"Konnte {remote}: nicht mounten. Details: "
+                    f"journalctl --user -u {rclone_service_name(remote)}",
+                )
+                return
+        self.navigate_callback(mount_dir)
+        if not was_mounted:
+            # Das eigentliche Verzeichnislisting von Google kann je nach
+            # Rate-Limit auf rclones geteiltem Client mehrere -zig Sekunden
+            # dauern — NICHT blockierend abwarten (fühlt sich wie ein
+            # Einfrieren an), sondern per Timer im Hintergrund pollen und
+            # erneut navigieren, sobald wirklich Inhalt da ist. fm bleibt
+            # währenddessen voll bedienbar.
+            self._poll_rclone_ready(remote, attempts=0)
+
+    def _poll_rclone_ready(self, remote: str, attempts: int) -> None:
+        mount_dir = rclone_mount_dir(remote)
+        try:
+            has_content = rclone_is_mounted(remote) and any(mount_dir.iterdir())
+        except OSError:
+            has_content = False
+        if has_content:
+            self.navigate_callback(mount_dir)
+            self._refresh_cloud()
+            return
+        if attempts >= 90:  # ~45s bei 0.5s Abstand, dann aufgeben (still)
+            return
+        QTimer.singleShot(500, lambda: self._poll_rclone_ready(remote, attempts + 1))
 
     def _disconnect_rclone(self, remote: str) -> None:
+        # disable, nicht nur stop — sonst kommt der Mount beim nächsten
+        # Login automatisch wieder (siehe enable in _open_rclone).
         subprocess.run(
-            ["systemctl", "--user", "stop", rclone_service_name(remote)],
+            ["systemctl", "--user", "disable", "--now", rclone_service_name(remote)],
             capture_output=True, timeout=15,
         )
         self._refresh_cloud()
