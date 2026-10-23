@@ -5,11 +5,21 @@ Archiv-Unterstützung und einem Projekt-Generator für neue Entwicklungsprojekte
 
 ## Screenshots
 
-![fm – Dual-Pane](assets/fm.png)
+![fm im Überblick](assets/fm-overview.png)
 
-![Neues Projekt (F7)](assets/fm.new.project.png)
+Was im Screenshot zu sehen ist:
 
-![Projektauswahl](assets/fm.project.selection.png)
+| # | Bereich | Beschreibung |
+|---|---|---|
+| 1 | Menüleiste | Datei, Bearbeiten, Ansicht, System, Archiv, Gehe zu, Hilfe |
+| 2 | Lesezeichen-Leiste | Links andockbar (Strg+B), Klick navigiert das aktive Pane dorthin |
+| 3 | Tabs | Pro Pane mehrere Orte offen (Strg+T neu, Strg+W schließen) |
+| 4 | Breadcrumb | Aktueller Pfad, Strg+L zum direkten Eingeben |
+| 5 | Dual-Pane-Ansicht | Zwei unabhängige Dateilisten nebeneinander, mit passenden Dateityp-Icons |
+| 6 | Terminal-Panel | Eingebettetes echtes Terminal unten (F4), „→ aktueller Ordner“ springt dorthin |
+| 7 | Statusleiste | Auswahl/Pfad des zuletzt aktiven Panes |
+
+![Neues Projekt (F7)](assets/fm-new-project.png)
 
 ## Funktionen
 
