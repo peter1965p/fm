@@ -44,6 +44,7 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
+import psutil
 import pyte
 from PySide6.QtCore import (
     QDir,
@@ -56,6 +57,7 @@ from PySide6.QtCore import (
     QSocketNotifier,
     Qt,
     QThread,
+    QTimer,
     Signal,
 )
 from PySide6.QtGui import (
@@ -95,6 +97,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -105,6 +108,7 @@ from PySide6.QtWidgets import (
     QTabBar,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QToolButton,
     QTreeView,
     QTreeWidget,
@@ -362,6 +366,25 @@ QGroupBox::title {{
     subcontrol-origin: margin;
     left: 8px;
     padding: 0 4px;
+}}
+
+QTabWidget::pane {{
+    border: 1px solid {_BORDER};
+    border-radius: 6px;
+    top: -1px;
+}}
+
+QProgressBar {{
+    background-color: {_PANEL};
+    border: 1px solid {_BORDER};
+    border-radius: 5px;
+    text-align: center;
+    color: {_TEXT};
+    height: 16px;
+}}
+QProgressBar::chunk {{
+    background-color: {_ACCENT_DIM};
+    border-radius: 4px;
 }}
 """
 
@@ -3579,6 +3602,298 @@ class TerminalPanel(QWidget):
         self.terminal.shutdown()
 
 
+# --------------------------------------------------------------------------
+# System-Manager: Prozesse + Ressourcen-Monitor (via psutil)
+# --------------------------------------------------------------------------
+
+class Sparkline(QWidget):
+    """Schlanke Verlaufsgrafik (0-100%) für z.B. CPU-Last — kein eigenes
+    Chart-Toolkit nötig für so ein kleines Diagramm."""
+
+    def __init__(self, max_points: int = 60, parent=None):
+        super().__init__(parent)
+        self.max_points = max_points
+        self._data: list[float] = []
+        self.setMinimumHeight(40)
+        self.setAttribute(Qt.WA_OpaquePaintEvent, True)
+
+    def set_data(self, values: list[float]) -> None:
+        self._data = values[-self.max_points:]
+        self.update()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(_PANEL))
+        if len(self._data) >= 2:
+            w, h = self.width(), self.height()
+            step = w / max(1, self.max_points - 1)
+            offset = self.max_points - len(self._data)
+            points = []
+            for i, value in enumerate(self._data):
+                x = (offset + i) * step
+                y = h - (min(100.0, max(0.0, value)) / 100.0) * h
+                points.append((x, y))
+            pen = painter.pen()
+            pen.setColor(QColor(_ACCENT))
+            pen.setWidth(2)
+            painter.setPen(pen)
+            for (x1, y1), (x2, y2) in zip(points, points[1:]):
+                painter.drawLine(int(x1), int(y1), int(x2), int(y2))
+        painter.end()
+
+
+class _NumericItem(QTableWidgetItem):
+    """QTableWidgetItem, das numerisch statt alphabetisch sortiert (sonst
+    landet '100' vor '20')."""
+
+    def __init__(self, value: float, text: str):
+        super().__init__(text)
+        self._value = value
+
+    def __lt__(self, other) -> bool:
+        if isinstance(other, _NumericItem):
+            return self._value < other._value
+        return super().__lt__(other)
+
+
+class ProcessManagerTab(QWidget):
+    COLUMNS = ("PID", "Name", "Nutzer", "CPU %", "RAM", "Befehl")
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._proc_cache: dict[int, psutil.Process] = {}
+
+        self.filter_edit = QLineEdit(self)
+        self.filter_edit.setPlaceholderText("Nach Name/Befehl filtern …")
+
+        self.table = QTableWidget(0, len(self.COLUMNS), self)
+        self.table.setHorizontalHeaderLabels(self.COLUMNS)
+        self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.Stretch)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._show_context_menu)
+        self.table.setSortingEnabled(False)
+
+        count_label_row = QHBoxLayout()
+        self.count_label = QLabel("")
+        self.count_label.setStyleSheet(f"color: {_TEXT_MUTED};")
+        count_label_row.addWidget(self.filter_edit, 1)
+        count_label_row.addWidget(self.count_label)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(count_label_row)
+        layout.addWidget(self.table)
+
+        self.filter_edit.textChanged.connect(self._refresh)
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._refresh)
+
+    def start_polling(self) -> None:
+        self._refresh()
+        self.timer.start(2000)
+
+    def stop_polling(self) -> None:
+        self.timer.stop()
+
+    def _show_context_menu(self, pos) -> None:
+        row = self.table.rowAt(pos.y())
+        if row < 0:
+            return
+        pid = int(self.table.item(row, 0).text())
+        menu = QMenu(self)
+        menu.addAction("Beenden (SIGTERM)", lambda: self._signal_pid(pid, "term"))
+        menu.addAction("Erzwingen (SIGKILL)", lambda: self._signal_pid(pid, "kill"))
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def _signal_pid(self, pid: int, mode: str) -> None:
+        try:
+            proc = psutil.Process(pid)
+            proc.terminate() if mode == "term" else proc.kill()
+        except psutil.NoSuchProcess:
+            pass
+        except psutil.AccessDenied:
+            QMessageBox.warning(
+                self, "Keine Berechtigung",
+                f"Prozess {pid} gehört einem anderen Nutzer — ohne Root nicht beendbar.",
+            )
+
+    def _refresh(self) -> None:
+        filter_text = self.filter_edit.text().strip().lower()
+        current_pids = set(psutil.pids())
+        for pid in list(self._proc_cache):
+            if pid not in current_pids:
+                del self._proc_cache[pid]
+
+        rows = []
+        for pid in current_pids:
+            proc = self._proc_cache.get(pid)
+            if proc is None:
+                try:
+                    proc = psutil.Process(pid)
+                    proc.cpu_percent(None)  # Baseline — erster Wert ist immer 0.0
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+                self._proc_cache[pid] = proc
+            try:
+                name = proc.name()
+                user = proc.username()
+                cpu = proc.cpu_percent(None)
+                rss = proc.memory_info().rss
+                cmdline = " ".join(proc.cmdline()) or f"[{name}]"
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+            if filter_text and filter_text not in name.lower() and filter_text not in cmdline.lower():
+                continue
+            rows.append((pid, name, user, cpu, rss, cmdline))
+
+        rows.sort(key=lambda r: r[3], reverse=True)  # nach CPU% absteigend, wie htop
+        self._populate(rows)
+        self.count_label.setText(f"{len(rows)} Prozesse")
+
+    def _populate(self, rows: list[tuple]) -> None:
+        self.table.setRowCount(len(rows))
+        for row_idx, (pid, name, user, cpu, rss, cmdline) in enumerate(rows):
+            self.table.setItem(row_idx, 0, _NumericItem(pid, str(pid)))
+            self.table.setItem(row_idx, 1, QTableWidgetItem(name))
+            self.table.setItem(row_idx, 2, QTableWidgetItem(user))
+            self.table.setItem(row_idx, 3, _NumericItem(cpu, f"{cpu:.1f}"))
+            self.table.setItem(row_idx, 4, _NumericItem(rss, human_size(rss)))
+            self.table.setItem(row_idx, 5, QTableWidgetItem(cmdline))
+
+
+class ResourceMonitorTab(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        psutil.cpu_percent(percpu=True)  # erste Messung verwerfen (Baseline)
+        self._last_net = psutil.net_io_counters()
+        self._last_disk = psutil.disk_io_counters()
+        self._cpu_history: list[float] = []
+
+        layout = QVBoxLayout(self)
+
+        cpu_group = QGroupBox("CPU", self)
+        cpu_layout = QVBoxLayout(cpu_group)
+        self.cpu_bar = QProgressBar(self)
+        self.cpu_bar.setFormat("Gesamt: %p%")
+        cpu_layout.addWidget(self.cpu_bar)
+        self.sparkline = Sparkline(parent=self)
+        cpu_layout.addWidget(self.sparkline)
+        self.core_bars_layout = QVBoxLayout()
+        cpu_layout.addLayout(self.core_bars_layout)
+        self._core_bars: list[QProgressBar] = []
+        layout.addWidget(cpu_group)
+
+        mem_group = QGroupBox("Speicher", self)
+        mem_layout = QVBoxLayout(mem_group)
+        self.ram_bar = QProgressBar(self)
+        self.swap_bar = QProgressBar(self)
+        mem_layout.addWidget(QLabel("RAM:"))
+        mem_layout.addWidget(self.ram_bar)
+        mem_layout.addWidget(QLabel("Swap:"))
+        mem_layout.addWidget(self.swap_bar)
+        layout.addWidget(mem_group)
+
+        io_group = QGroupBox("Netzwerk & Datenträger", self)
+        io_form = QFormLayout(io_group)
+        self.net_label = QLabel("–")
+        self.disk_label = QLabel("–")
+        io_form.addRow("Netzwerk ↓/↑:", self.net_label)
+        io_form.addRow("Datenträger lesen/schreiben:", self.disk_label)
+        layout.addWidget(io_group)
+
+        layout.addStretch(1)
+
+        self._interval_ms = 1500
+        self.timer = QTimer(self)
+        self.timer.setInterval(self._interval_ms)
+        self.timer.timeout.connect(self._refresh)
+
+    def start_polling(self) -> None:
+        self._refresh()
+        self.timer.start()
+
+    def stop_polling(self) -> None:
+        self.timer.stop()
+
+    def _ensure_core_bars(self, count: int) -> None:
+        while len(self._core_bars) < count:
+            bar = QProgressBar(self)
+            bar.setFormat(f"Kern {len(self._core_bars)}: %p%")
+            bar.setMaximumHeight(14)
+            self._core_bars.append(bar)
+            self.core_bars_layout.addWidget(bar)
+
+    def _refresh(self) -> None:
+        percpu = psutil.cpu_percent(percpu=True)
+        overall = sum(percpu) / len(percpu) if percpu else 0.0
+        self.cpu_bar.setValue(round(overall))
+        self._cpu_history.append(overall)
+        if len(self._cpu_history) > self.sparkline.max_points:
+            self._cpu_history.pop(0)
+        self.sparkline.set_data(self._cpu_history)
+
+        self._ensure_core_bars(len(percpu))
+        for bar, pct in zip(self._core_bars, percpu):
+            bar.setValue(round(pct))
+
+        vm = psutil.virtual_memory()
+        self.ram_bar.setValue(round(vm.percent))
+        self.ram_bar.setFormat(f"{human_size(vm.used)} / {human_size(vm.total)} (%p%)")
+        sm = psutil.swap_memory()
+        self.swap_bar.setValue(round(sm.percent))
+        self.swap_bar.setFormat(
+            f"{human_size(sm.used)} / {human_size(sm.total)} (%p%)" if sm.total else "kein Swap"
+        )
+
+        elapsed = self._interval_ms / 1000
+        net = psutil.net_io_counters()
+        recv_rate = (net.bytes_recv - self._last_net.bytes_recv) / elapsed
+        sent_rate = (net.bytes_sent - self._last_net.bytes_sent) / elapsed
+        self._last_net = net
+        self.net_label.setText(f"{human_size(int(recv_rate))}/s ↓  /  {human_size(int(sent_rate))}/s ↑")
+
+        disk = psutil.disk_io_counters()
+        if disk is not None and self._last_disk is not None:
+            read_rate = (disk.read_bytes - self._last_disk.read_bytes) / elapsed
+            write_rate = (disk.write_bytes - self._last_disk.write_bytes) / elapsed
+            self.disk_label.setText(f"{human_size(int(read_rate))}/s lesen  /  {human_size(int(write_rate))}/s schreiben")
+        self._last_disk = disk
+
+
+class SystemManagerDialog(QDialog):
+    """Eigenständiges, nicht-modales Fenster (F6) — Prozesse und
+    Ressourcen fürs Erste; Pakete/Dienste/Mounts/Autostart folgen als
+    weitere Tabs in späteren Ausbaustufen."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("System-Manager")
+        self.setWindowFlag(Qt.Window, True)
+        self.resize(760, 560)
+
+        self.process_tab = ProcessManagerTab(self)
+        self.resource_tab = ResourceMonitorTab(self)
+
+        self.tabs = QTabWidget(self)
+        self.tabs.addTab(self.process_tab, "Prozesse")
+        self.tabs.addTab(self.resource_tab, "Ressourcen")
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.tabs)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self.process_tab.start_polling()
+        self.resource_tab.start_polling()
+
+    def hideEvent(self, event) -> None:
+        self.process_tab.stop_polling()
+        self.resource_tab.stop_polling()
+        super().hideEvent(event)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, start_path: Path):
         super().__init__()
@@ -3640,12 +3955,24 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence("F4"), self, activated=self._toggle_terminal)
         QShortcut(QKeySequence("Ctrl+B"), self, activated=self._toggle_bookmarks)
         QShortcut(QKeySequence("Ctrl+D"), self, activated=lambda: self.bookmarks_panel.add_current())
+        QShortcut(QKeySequence("F6"), self, activated=self._open_system_manager)
+
+        self.system_manager: SystemManagerDialog | None = None
 
         self._build_menu_bar()
 
     def closeEvent(self, event) -> None:
         self.terminal_panel.shutdown()
+        if self.system_manager is not None:
+            self.system_manager.close()
         super().closeEvent(event)
+
+    def _open_system_manager(self) -> None:
+        if self.system_manager is None:
+            self.system_manager = SystemManagerDialog(self)
+        self.system_manager.show()
+        self.system_manager.raise_()
+        self.system_manager.activateWindow()
 
     def _navigate_active_pane(self, path: Path) -> None:
         self.active_pane.navigate_to(path)
@@ -3707,6 +4034,9 @@ class MainWindow(QMainWindow):
         view_menu.addSeparator()
         view_menu.addAction("Terminal ein-/ausblenden\tF4", self._toggle_terminal)
         view_menu.addAction("Lesezeichen ein-/ausblenden\tStrg+B", self._toggle_bookmarks)
+
+        system_menu = menu_bar.addMenu("&System")
+        system_menu.addAction("System-Manager …\tF6", self._open_system_manager)
 
         archive_menu = menu_bar.addMenu("A&rchiv")
         archive_menu.addAction("Archiv öffnen", lambda: self.active_pane.open_archive())
