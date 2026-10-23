@@ -47,12 +47,16 @@ from pathlib import Path
 import psutil
 import pyte
 from PySide6.QtCore import (
+    Property,
     QDir,
+    QEasingCurve,
     QEvent,
     QItemSelectionModel,
     QMimeDatabase,
     QModelIndex,
     QObject,
+    QPropertyAnimation,
+    QRectF,
     QSize,
     QSocketNotifier,
     Qt,
@@ -390,28 +394,60 @@ QProgressBar::chunk {{
 
 
 class ToggleSwitch(QCheckBox):
-    """QCheckBox, per Stylesheet als runder Toggle-Switch dargestellt.
-    checked=False -> linke Position, checked=True -> rechte Position.
+    """Schlanker iOS-Style Switch mit animiert gleitendem Knopf — von Hand
+    gemalt statt über QCheckBox::indicator-QSS, weil ein stylesheet-
+    basierter Indicator keinen gleitenden Knopf hinbekommt (nur harte
+    Zustandswechsel, kein Subelement zum Verschieben). checked=False ->
+    Knopf links, checked=True -> Knopf rechts, mit kurzer Slide-Animation.
     """
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedSize(52, 28)
+        self._track_w = 36
+        self._track_h = 18
+        self._knob_d = 13
+        self._margin = 2.5
+        self.setFixedSize(self._track_w, self._track_h)
         self.setCursor(Qt.PointingHandCursor)
-        self.setStyleSheet(f"""
-            QCheckBox {{
-                spacing: 0px;
-            }}
-            QCheckBox::indicator {{
-                width: 52px;
-                height: 28px;
-                border-radius: 14px;
-                background-color: {_BORDER};
-            }}
-            QCheckBox::indicator:checked {{
-                background-color: {_ACCENT};
-            }}
-        """)
+        self.setStyleSheet("QCheckBox::indicator { width: 0; height: 0; }")
+
+        self._knob_x = self._margin
+        self._anim = QPropertyAnimation(self, b"knobPos", self)
+        self._anim.setDuration(140)
+        self._anim.setEasingCurve(QEasingCurve.OutCubic)
+        self.toggled.connect(self._animate_to)
+
+    def _animate_to(self, checked: bool) -> None:
+        end = self._track_w - self._knob_d - self._margin if checked else self._margin
+        self._anim.stop()
+        self._anim.setStartValue(self._knob_x)
+        self._anim.setEndValue(end)
+        self._anim.start()
+
+    def _get_knob_pos(self) -> float:
+        return self._knob_x
+
+    def _set_knob_pos(self, value: float) -> None:
+        self._knob_x = value
+        self.update()
+
+    knobPos = Property(float, _get_knob_pos, _set_knob_pos)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(Qt.NoPen)
+
+        track_color = QColor(_ACCENT) if self.isChecked() else QColor(_BORDER)
+        painter.setBrush(track_color)
+        painter.drawRoundedRect(
+            QRectF(0, 0, self._track_w, self._track_h), self._track_h / 2, self._track_h / 2
+        )
+
+        painter.setBrush(QColor("#f4f8fb"))
+        knob_y = (self._track_h - self._knob_d) / 2
+        painter.drawEllipse(QRectF(self._knob_x, knob_y, self._knob_d, self._knob_d))
+        painter.end()
 
 
 class TargetDirSwitch(QWidget):
