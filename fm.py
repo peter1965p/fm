@@ -22,6 +22,7 @@ Start:
 
 from __future__ import annotations
 
+import configparser
 import fcntl
 import fnmatch
 import grp
@@ -42,6 +43,7 @@ import tempfile
 import termios
 import zipfile
 from datetime import datetime
+from urllib.parse import quote as urlquote
 from pathlib import Path
 
 import psutil
@@ -2622,10 +2624,164 @@ def save_bookmarks(paths: list[Path]) -> None:
         pass
 
 
+# --------------------------------------------------------------------------
+# Laufwerke, Netzwerk, Cloud — für die Orte-Leiste. Alles über bereits auf
+# dem System vorhandene Standard-Werkzeuge (psutil, udisksctl, gio/GVFS,
+# GNOME Online Accounts), bewusst kein zusätzliches Drittool.
+# --------------------------------------------------------------------------
+
+# Btrfs-Subvolumes & System-interne Mountpoints sind für eine Orte-Leiste
+# nur Rauschen (niemand will /var/log oder /boot anklicken) — alles unter
+# diesen Präfixen wird ausgeblendet, "/" selbst bleibt als "System" sichtbar.
+_DRIVE_SKIP_PREFIXES = ("/boot", "/srv", "/root", "/var", "/run", "/sys", "/proc", "/dev", "/tmp", "/efi")
+
+
+def list_drive_places() -> list[tuple[str, Path, str]]:
+    """(Anzeigename, Mountpoint, Blockgerät) für sinnvolle, nicht-interne
+    Mountpoints."""
+    places: list[tuple[str, Path, str]] = []
+    seen: set[str] = set()
+    try:
+        partitions = psutil.disk_partitions(all=False)
+    except Exception:
+        partitions = []
+    for part in partitions:
+        mp_str = part.mountpoint
+        if mp_str in seen:
+            continue
+        if mp_str != "/" and any(mp_str == p or mp_str.startswith(p + "/") for p in _DRIVE_SKIP_PREFIXES):
+            continue
+        seen.add(mp_str)
+        mp = Path(mp_str)
+        if mp_str == "/":
+            label = "System (/)"
+        else:
+            label = mp.name or mp_str
+        places.append((label, mp, part.device))
+    return places
+
+
+GOA_ACCOUNTS_FILE = Path.home() / ".config" / "goa-1.0" / "accounts.conf"
+
+
+def list_google_accounts() -> list[tuple[str, str]]:
+    """(Konto-ID, Anzeigename) je über GNOME Online Accounts eingerichtetem
+    Google-Konto. Die Konto-ID ist exakt der Teil nach 'Account ' im
+    Abschnittsnamen — identisch mit dem Host-Teil in der
+    google-drive://<id>/-URI, die gvfs-goa fürs Mounten erwartet."""
+    if not GOA_ACCOUNTS_FILE.is_file():
+        return []
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(GOA_ACCOUNTS_FILE)
+    except configparser.Error:
+        return []
+    accounts = []
+    for section in parser.sections():
+        if not section.startswith("Account ") or parser.get(section, "Provider", fallback="") != "google":
+            continue
+        account_id = section[len("Account "):]
+        label = parser.get(section, "PresentationIdentity", fallback=None) or \
+            parser.get(section, "Identity", fallback=account_id)
+        accounts.append((account_id, label))
+    return accounts
+
+
+def gvfs_root() -> Path:
+    return Path(f"/run/user/{os.getuid()}/gvfs")
+
+
+def find_gvfs_mount(prefix: str) -> Path | None:
+    root = gvfs_root()
+    if not root.is_dir():
+        return None
+    for entry in sorted(root.iterdir()):
+        if entry.name.startswith(prefix):
+            return entry
+    return None
+
+
+def humanize_gvfs_name(name: str) -> str:
+    """'smb-share:server=X,share=Y' -> 'SMB — X/Y', für eine lesbare
+    Beschriftung in der Orte-Leiste statt des rohen GVFS-Verzeichnisnamens."""
+    scheme, _, rest = name.partition(":")
+    label = {
+        "smb-share": "SMB", "ftp": "FTP", "sftp": "SFTP",
+        "dav": "WebDAV", "davs": "WebDAV (TLS)", "nfs-share": "NFS",
+    }.get(scheme, scheme)
+    parts = dict(kv.split("=", 1) for kv in rest.split(",") if "=" in kv)
+    host = parts.get("server") or parts.get("host") or ""
+    share = parts.get("share") or parts.get("user") or ""
+    detail = "/".join(p for p in (host, share) if p)
+    return f"{label} — {detail}" if detail else label
+
+
+class NetworkConnectDialog(QDialog):
+    """Baut aus Protokoll/Server/Freigabe/Zugangsdaten eine gio-URI
+    (smb://user:pass@host/share o.ä.). Zugangsdaten werden nirgends
+    gespeichert, nur zum Verbindungsaufbau verwendet."""
+
+    SCHEMES = ["smb", "ftp", "sftp", "dav", "davs", "nfs"]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Netzwerkfreigabe verbinden")
+
+        form = QFormLayout()
+        self.scheme_combo = QComboBox(self)
+        self.scheme_combo.addItems(self.SCHEMES)
+        self.host_edit = QLineEdit(self)
+        self.host_edit.setPlaceholderText("server.lokal oder 192.168.1.10")
+        self.share_edit = QLineEdit(self)
+        self.share_edit.setPlaceholderText("Freigabename/Pfad (optional)")
+        self.user_edit = QLineEdit(self)
+        self.user_edit.setPlaceholderText("optional — leer = anonym/gespeichert")
+        self.pass_edit = QLineEdit(self)
+        self.pass_edit.setEchoMode(QLineEdit.Password)
+        form.addRow("Protokoll:", self.scheme_combo)
+        form.addRow("Server:", self.host_edit)
+        form.addRow("Freigabe/Pfad:", self.share_edit)
+        form.addRow("Benutzer:", self.user_edit)
+        form.addRow("Passwort:", self.pass_edit)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        buttons.button(QDialogButtonBox.Ok).setText("Verbinden")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+
+    def build_uri(self) -> str:
+        host = self.host_edit.text().strip()
+        if not host:
+            return ""
+        scheme = self.scheme_combo.currentText()
+        share = self.share_edit.text().strip().strip("/")
+        user = self.user_edit.text().strip()
+        password = self.pass_edit.text()
+        auth = ""
+        if user:
+            auth = urlquote(user, safe="")
+            if password:
+                auth += f":{urlquote(password, safe='')}"
+            auth += "@"
+        path = f"/{share}" if share else "/"
+        return f"{scheme}://{auth}{host}{path}"
+
+
 class BookmarksPanel(QWidget):
-    """Andockbare Lesezeichen-Leiste links: Klick navigiert das aktive
-    Pane dorthin, "+" merkt sich dessen aktuellen Ordner, Rechtsklick
-    entfernt einen Eintrag. Persistiert nach ~/.config/fm/bookmarks.json."""
+    """Andockbare Orte-Leiste links, wie bei Dolphin/Nautilus: Favoriten
+    (eigene Lesezeichen), Laufwerke (gemountete Partitionen/Wechsel-
+    datenträger), Netzwerk (SMB/FTP/... via gio/GVFS) und Cloud (Google
+    Drive via GNOME Online Accounts). Favoriten persistieren nach
+    ~/.config/fm/bookmarks.json, der Rest wird live abgefragt."""
+
+    SECTION_FAVORITES = "Favoriten"
+    SECTION_DRIVES = "Laufwerke"
+    SECTION_NETWORK = "Netzwerk"
+    SECTION_CLOUD = "Cloud"
 
     def __init__(self, navigate_callback, get_active_dir, parent=None):
         super().__init__(parent)
@@ -2639,64 +2795,257 @@ class BookmarksPanel(QWidget):
         header_layout = QHBoxLayout(header)
         header_layout.setContentsMargins(8, 0, 4, 0)
         header_layout.setSpacing(2)
-        title = QLabel("Lesezeichen", header)
+        title = QLabel("Orte", header)
         title.setStyleSheet(_FLAT_TITLE_STYLE)
+        refresh_btn = QToolButton(header)
+        refresh_btn.setText("⟳")
+        refresh_btn.setToolTip("Laufwerke/Netzwerk/Cloud aktualisieren")
+        refresh_btn.setStyleSheet(_FLAT_BUTTON_STYLE)
+        refresh_btn.clicked.connect(self.refresh_all)
         add_btn = QToolButton(header)
         add_btn.setText("+")
-        add_btn.setToolTip("Aktuellen Ordner als Lesezeichen hinzufügen (Strg+D)")
+        add_btn.setToolTip("Aktuellen Ordner zu Favoriten hinzufügen (Strg+D)")
         add_btn.setStyleSheet(_FLAT_BUTTON_STYLE)
         add_btn.clicked.connect(self.add_current)
         header_layout.addWidget(title)
         header_layout.addStretch()
+        header_layout.addWidget(refresh_btn)
         header_layout.addWidget(add_btn)
 
-        self.list_widget = QListWidget(self)
-        self.list_widget.itemClicked.connect(self._on_item_clicked)
-        self.list_widget.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.list_widget.customContextMenuRequested.connect(self._show_context_menu)
+        self.tree = QTreeWidget(self)
+        self.tree.setHeaderHidden(True)
+        self.tree.setIndentation(12)
+        self.tree.itemClicked.connect(self._on_item_clicked)
+        self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._show_context_menu)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(header)
-        layout.addWidget(self.list_widget)
+        layout.addWidget(self.tree)
 
-        self._refresh_list()
+        self._sections: dict[str, QTreeWidgetItem] = {}
+        for name in (self.SECTION_FAVORITES, self.SECTION_DRIVES, self.SECTION_NETWORK, self.SECTION_CLOUD):
+            section_item = QTreeWidgetItem([name])
+            section_item.setFlags(Qt.ItemIsEnabled)  # Header: nicht klickbar/selektierbar als Ort
+            font = section_item.font(0)
+            font.setBold(True)
+            section_item.setFont(0, font)
+            section_item.setForeground(0, QColor(_TEXT_MUTED))
+            self.tree.addTopLevelItem(section_item)
+            section_item.setExpanded(True)
+            self._sections[name] = section_item
 
-    def _refresh_list(self) -> None:
-        self.list_widget.clear()
+        self.refresh_all()
+
+    def refresh_all(self) -> None:
+        self._refresh_favorites()
+        self._refresh_drives()
+        self._refresh_network()
+        self._refresh_cloud()
+
+    # ----------------------------------------------------------------
+    # Favoriten
+    # ----------------------------------------------------------------
+
+    def _refresh_favorites(self) -> None:
+        section = self._sections[self.SECTION_FAVORITES]
+        section.takeChildren()
         for path in self.bookmarks:
-            item = QListWidgetItem(path.name or str(path))
-            item.setToolTip(str(path))
-            item.setData(Qt.UserRole, str(path))
-            self.list_widget.addItem(item)
-
-    def _on_item_clicked(self, item: QListWidgetItem) -> None:
-        path = Path(item.data(Qt.UserRole))
-        if path.is_dir():
-            self.navigate_callback(path)
+            item = QTreeWidgetItem([path.name or str(path)])
+            item.setToolTip(0, str(path))
+            item.setData(0, Qt.UserRole, {"kind": "path", "path": str(path)})
+            section.addChild(item)
 
     def add_current(self) -> None:
         path = self.get_active_dir()
         if path not in self.bookmarks:
             self.bookmarks.append(path)
             save_bookmarks(self.bookmarks)
-            self._refresh_list()
+            self._refresh_favorites()
 
-    def _show_context_menu(self, pos) -> None:
-        item = self.list_widget.itemAt(pos)
-        if item is None:
-            return
-        menu = QMenu(self)
-        menu.addAction("Entfernen", lambda: self._remove(item))
-        menu.exec(self.list_widget.viewport().mapToGlobal(pos))
-
-    def _remove(self, item: QListWidgetItem) -> None:
-        path = Path(item.data(Qt.UserRole))
+    def _remove_favorite(self, path: Path) -> None:
         if path in self.bookmarks:
             self.bookmarks.remove(path)
             save_bookmarks(self.bookmarks)
-            self._refresh_list()
+            self._refresh_favorites()
+
+    # ----------------------------------------------------------------
+    # Laufwerke
+    # ----------------------------------------------------------------
+
+    def _refresh_drives(self) -> None:
+        section = self._sections[self.SECTION_DRIVES]
+        section.takeChildren()
+        for label, path, device in list_drive_places():
+            item = QTreeWidgetItem([label])
+            item.setToolTip(0, str(path))
+            item.setData(0, Qt.UserRole, {"kind": "path", "path": str(path), "device": device})
+            section.addChild(item)
+
+    def _unmount_drive(self, device: str) -> None:
+        if not device:
+            QMessageBox.information(self, "Nicht möglich", "Kein Gerätepfad bekannt.")
+            return
+        try:
+            result = subprocess.run(
+                ["udisksctl", "unmount", "-b", device], capture_output=True, text=True, timeout=15,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+            QMessageBox.warning(self, "Fehler", str(exc))
+            return
+        if result.returncode != 0:
+            QMessageBox.warning(self, "Aushängen fehlgeschlagen", result.stderr.strip() or "Unbekannter Fehler")
+        self._refresh_drives()
+
+    # ----------------------------------------------------------------
+    # Netzwerk
+    # ----------------------------------------------------------------
+
+    def _refresh_network(self) -> None:
+        section = self._sections[self.SECTION_NETWORK]
+        section.takeChildren()
+        connect_item = QTreeWidgetItem(["+ Verbinden …"])
+        connect_item.setData(0, Qt.UserRole, {"kind": "action", "action": "connect_network"})
+        section.addChild(connect_item)
+        root = gvfs_root()
+        if root.is_dir():
+            for entry in sorted(root.iterdir()):
+                if entry.name.startswith(("google-drive:", "onedrive:", "owncloud:")):
+                    continue  # eigener Cloud-Abschnitt zeigt diese
+                item = QTreeWidgetItem([humanize_gvfs_name(entry.name)])
+                item.setToolTip(0, str(entry))
+                item.setData(0, Qt.UserRole, {"kind": "path", "path": str(entry), "gio_mount": True})
+                section.addChild(item)
+
+    def _connect_network(self) -> None:
+        dialog = NetworkConnectDialog(self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        uri = dialog.build_uri()
+        if not uri:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            result = subprocess.run(["gio", "mount", uri], capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, "Zeitüberschreitung", "Verbindung hat zu lange gedauert (Adresse/Zugangsdaten prüfen).")
+            return
+        except FileNotFoundError:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, "gio fehlt", "Das Kommando 'gio' wurde nicht gefunden (Paket glib2).")
+            return
+        QApplication.restoreOverrideCursor()
+        if result.returncode != 0:
+            QMessageBox.warning(self, "Verbindung fehlgeschlagen", result.stderr.strip() or "Unbekannter Fehler")
+            return
+        self._refresh_network()
+
+    def _unmount_gio_path(self, path: Path) -> None:
+        try:
+            result = subprocess.run(["gio", "mount", "-u", str(path)], capture_output=True, text=True, timeout=15)
+        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+            QMessageBox.warning(self, "Fehler", str(exc))
+            return
+        if result.returncode != 0:
+            QMessageBox.warning(self, "Trennen fehlgeschlagen", result.stderr.strip() or "Unbekannter Fehler")
+        self._refresh_network()
+        self._refresh_cloud()
+
+    # ----------------------------------------------------------------
+    # Cloud (Google Drive via GNOME Online Accounts — kein Drittool,
+    # dieselbe Technik wie bei Nautilus: gnome-control-center zum
+    # Verbinden, gio zum Mounten, GVFS-FUSE macht den Mount für fm wie
+    # jeden normalen Ordner durchsuchbar)
+    # ----------------------------------------------------------------
+
+    def _refresh_cloud(self) -> None:
+        section = self._sections[self.SECTION_CLOUD]
+        section.takeChildren()
+        accounts = list_google_accounts()
+        if not accounts:
+            item = QTreeWidgetItem(["+ Google Drive verbinden …"])
+            item.setData(0, Qt.UserRole, {"kind": "action", "action": "connect_google"})
+            section.addChild(item)
+            return
+        for account_id, label in accounts:
+            item = QTreeWidgetItem([f"Google Drive ({label})"])
+            item.setData(0, Qt.UserRole, {"kind": "action", "action": "open_google", "account_id": account_id})
+            section.addChild(item)
+
+    def _connect_google(self) -> None:
+        if shutil.which("gnome-control-center") is None:
+            QMessageBox.information(
+                self, "Nicht verfügbar",
+                "gnome-control-center ist nicht installiert — Google-Konto kann nicht "
+                "eingerichtet werden (Paket: gnome-control-center).",
+            )
+            return
+        subprocess.Popen(["gnome-control-center", "online-accounts"])
+        QMessageBox.information(
+            self, "Google-Konto verbinden",
+            "Richte dein Google-Konto im sich öffnenden Fenster ein. Danach hier oben "
+            "auf ⟳ (Aktualisieren) klicken, um Google Drive in der Orte-Leiste zu sehen.",
+        )
+
+    def _open_google(self, account_id: str) -> None:
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            subprocess.run(
+                ["gio", "mount", f"google-drive://{account_id}/"],
+                capture_output=True, text=True, timeout=30,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        QApplication.restoreOverrideCursor()
+        mount = find_gvfs_mount("google-drive:")
+        if mount is not None:
+            self.navigate_callback(mount)
+        elif gvfs_root().is_dir():
+            self.navigate_callback(gvfs_root())
+        else:
+            QMessageBox.warning(self, "Nicht gefunden", "Google Drive konnte nicht gemountet werden.")
+
+    # ----------------------------------------------------------------
+    # Gemeinsame Klick-/Kontextmenü-Behandlung
+    # ----------------------------------------------------------------
+
+    def _on_item_clicked(self, item: QTreeWidgetItem, _column: int) -> None:
+        data = item.data(0, Qt.UserRole)
+        if not data:
+            return
+        if data["kind"] == "path":
+            path = Path(data["path"])
+            if path.is_dir():
+                self.navigate_callback(path)
+        elif data["kind"] == "action":
+            action = data["action"]
+            if action == "connect_network":
+                self._connect_network()
+            elif action == "connect_google":
+                self._connect_google()
+            elif action == "open_google":
+                self._open_google(data["account_id"])
+
+    def _show_context_menu(self, pos) -> None:
+        item = self.tree.itemAt(pos)
+        if item is None or item.parent() is None:
+            return  # Section-Header selbst hat kein Kontextmenü
+        data = item.data(0, Qt.UserRole)
+        if not data:
+            return
+        section_name = item.parent().text(0)
+        menu = QMenu(self)
+        if section_name == self.SECTION_FAVORITES:
+            menu.addAction("Entfernen", lambda: self._remove_favorite(Path(data["path"])))
+        elif section_name == self.SECTION_DRIVES:
+            menu.addAction("Aushängen", lambda: self._unmount_drive(data.get("device", "")))
+        elif section_name == self.SECTION_NETWORK and data["kind"] == "path":
+            menu.addAction("Trennen", lambda: self._unmount_gio_path(Path(data["path"])))
+        if not menu.isEmpty():
+            menu.exec(self.tree.viewport().mapToGlobal(pos))
 
 
 class FilePane(QWidget):
@@ -3942,7 +4291,7 @@ class MainWindow(QMainWindow):
         self.status.showMessage(
             "F7 Neues Projekt · Strg+C/X/V Kopieren/Ausschneiden/Einfügen · "
             "F2 Umbenennen · Entf Löschen · F3 Vorschau · F5 Refresh · "
-            "F4 Terminal · Strg+T Neuer Tab · Strg+B Lesezeichen · "
+            "F4 Terminal · Strg+T Neuer Tab · Strg+B Orte-Leiste · "
             "Drag&Drop zum Verschieben, Strg+Ziehen zum Kopieren"
         )
 
@@ -4069,7 +4418,7 @@ class MainWindow(QMainWindow):
         view_menu.addAction("Vorschau\tF3", lambda: self.active_pane.preview_selection())
         view_menu.addSeparator()
         view_menu.addAction("Terminal ein-/ausblenden\tF4", self._toggle_terminal)
-        view_menu.addAction("Lesezeichen ein-/ausblenden\tStrg+B", self._toggle_bookmarks)
+        view_menu.addAction("Orte-Leiste ein-/ausblenden\tStrg+B", self._toggle_bookmarks)
 
         system_menu = menu_bar.addMenu("&System")
         system_menu.addAction("System-Manager …\tF6", self._open_system_manager)
