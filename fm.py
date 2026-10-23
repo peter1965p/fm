@@ -2983,7 +2983,16 @@ class BookmarksPanel(QWidget):
                 "eingerichtet werden (Paket: gnome-control-center).",
             )
             return
-        subprocess.Popen(["gnome-control-center", "online-accounts"])
+        # gnome-control-center verweigert den Start außerhalb von GNOME/Unity
+        # ("Running gnome-control-center is only supported under GNOME and
+        # Unity, exiting") — auf KDE/Xfce/etc. bricht es sonst sofort und
+        # lautlos ab, ohne dass sich ein Fenster öffnet. XDG_CURRENT_DESKTOP
+        # für den Aufruf zu überschreiben ist der verbreitete Workaround
+        # dafür; der Online-Accounts-Dienst (goa-daemon) selbst läuft
+        # Desktop-unabhängig.
+        env = os.environ.copy()
+        env["XDG_CURRENT_DESKTOP"] = "GNOME"
+        subprocess.Popen(["gnome-control-center", "online-accounts"], env=env)
         QMessageBox.information(
             self, "Google-Konto verbinden",
             "Richte dein Google-Konto im sich öffnenden Fenster ein. Danach hier oben "
