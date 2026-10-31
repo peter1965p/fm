@@ -133,15 +133,20 @@ from PySide6.QtWidgets import (
 # damit nichts aus dem Rahmen fällt.
 # --------------------------------------------------------------------------
 
-_BG = "#0b0f14"
-_PANEL = "#11161d"
-_PANEL_ALT = "#161c25"
-_BORDER = "#232b36"
-_TEXT = "#e6edf3"
-_TEXT_MUTED = "#7d8793"
-_ACCENT = "#2de2ff"
-_ACCENT_DIM = "#1aa8c4"
-_ACCENT_SOFT = "rgba(45, 226, 255, 40)"
+# Palette an SoftCenter angelehnt (softcenter/theme.py, Dark): neutrales
+# Anthrazit, Amber als Akzent. _ACCENT_TEXT ist die Schriftfarbe auf
+# Akzentflächen (dort "accent_text").
+_BG = "#15171c"
+_PANEL = "#1a1d22"
+_PANEL_ALT = "#1e2127"
+_BORDER = "#2e323b"
+_TEXT = "#e6e8ec"
+_TEXT_MUTED = "#8b919c"
+_ACCENT = "#f59e0b"
+_ACCENT_DIM = "#d97706"
+_ACCENT_SOFT = "rgba(245, 158, 11, 40)"
+_ACCENT_TEXT = "#1a1204"
+_SIDEBAR = "#111318"
 
 
 def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
@@ -155,7 +160,7 @@ QWidget {{
     color: {_TEXT};
     font-size: 13px;
     selection-background-color: {_ACCENT};
-    selection-color: #04141a;
+    selection-color: {_ACCENT_TEXT};
 }}
 
 QToolTip {{
@@ -280,7 +285,7 @@ QPushButton:hover, QToolButton:hover {{
 }}
 QPushButton:pressed, QToolButton:pressed {{
     background-color: {_ACCENT_DIM};
-    color: #04141a;
+    color: {_ACCENT_TEXT};
 }}
 QPushButton:checked, QToolButton:checked {{
     background-color: {_ACCENT_SOFT};
@@ -2983,6 +2988,7 @@ class BookmarksPanel(QWidget):
         self.tree = QTreeWidget(self)
         self.tree.setHeaderHidden(True)
         self.tree.setIndentation(12)
+        self.tree.setStyleSheet(f"QTreeWidget {{ background-color: {_SIDEBAR}; }}")
         self.tree.itemClicked.connect(self._on_item_clicked)
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._show_context_menu)
