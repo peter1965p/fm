@@ -16,8 +16,18 @@ Was im Screenshot zu sehen ist:
 | 3 | Tabs | Pro Pane mehrere Orte offen (Strg+T neu, Strg+W schließen) |
 | 4 | Breadcrumb | Aktueller Pfad, Strg+L zum direkten Eingeben |
 | 5 | Dual-Pane-Ansicht | Zwei unabhängige Dateilisten nebeneinander, mit passenden Dateityp-Icons |
-| 6 | Terminal-Panel | Eingebettetes echtes Terminal unten (F4), „→ aktueller Ordner“ springt dorthin |
-| 7 | Statusleiste | Auswahl/Pfad des zuletzt aktiven Panes |
+
+**Eingebettetes Terminal (F4)** — echte Shell unten im Fenster, „→ aktueller Ordner“ springt in den Ordner des aktiven Panes:
+
+![Terminal](assets/fm-terminal.png)
+
+**System-Manager (F6)** — eigenes Fenster mit Prozessliste und Ressourcen-Monitor:
+
+![System-Manager: Prozesse](assets/fm-system-prozesse.png)
+
+![System-Manager: Ressourcen](assets/fm-system-ressourcen.png)
+
+**Neues Projekt (F7)** — Projekt-Generator für Python, Node, Java, Phoenix, .NET und mehr:
 
 ![Neues Projekt (F7)](assets/fm-new-project.png)
 
