@@ -60,7 +60,7 @@ if command -v git >/dev/null; then
     mkdir -p "$HOME/.config/systemd/user"
     cat > "$HOME/.config/systemd/user/fm-update.service" <<EOF
 [Unit]
-Description=fm — Git-Auto-Update
+Description=fm — Update auf neuesten Release
 
 [Service]
 Type=oneshot
@@ -69,7 +69,7 @@ EOF
 
     cat > "$HOME/.config/systemd/user/fm-update.timer" <<EOF
 [Unit]
-Description=Zeitplan für fm-Git-Auto-Update
+Description=Zeitplan für fm-Release-Update
 
 [Timer]
 OnCalendar=daily
@@ -81,7 +81,7 @@ EOF
 
     systemctl --user daemon-reload
     systemctl --user enable --now fm-update.timer
-    echo "Auto-Update-Timer aktiv (täglich, git pull in $REPO_DIR)."
+    echo "Auto-Update-Timer aktiv (täglich: neuester Release, Git-Tag vX.Y.Z, in $REPO_DIR)."
 fi
 
 echo "Fertig."

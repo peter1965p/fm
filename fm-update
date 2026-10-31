@@ -1,8 +1,10 @@
 #!/bin/bash
-# Wird vom fm-update.timer (systemd --user) täglich aufgerufen: holt
-# Updates aus dem fm-Git-Repo per 'git pull'. Lokale, noch nicht
-# committete Änderungen werden NICHT gestasht oder überschrieben —
-# --ff-only bricht in dem Fall sauber ab, es geht nichts verloren.
+# Wird vom fm-update.timer (systemd --user) täglich aufgerufen: aktualisiert
+# fm auf den neuesten Release (Git-Tag vX.Y.Z). Es wird nur bis zum Release-
+# Stand gezogen, nicht jeder neue Commit von master. Lokale, noch nicht
+# committete Änderungen werden NICHT gestasht oder überschrieben — der
+# fast-forward-Merge bricht in dem Fall sauber ab, es geht nichts verloren.
+# Dieselbe Logik nutzt fm selbst (check_and_apply_update in fm.py).
 set -u
 cd "$(dirname "$0")" || exit 1
 
@@ -11,18 +13,29 @@ if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     exit 1
 fi
 
-BEFORE=$(git rev-parse HEAD)
-if ! git pull --ff-only --quiet; then
-    echo "fm-update: git pull fehlgeschlagen (lokale Änderungen oder abweichende Historie?) — übersprungen." >&2
+if ! git fetch --tags --quiet origin; then
+    echo "fm-update: git fetch fehlgeschlagen (offline?) — übersprungen." >&2
     exit 1
 fi
-AFTER=$(git rev-parse HEAD)
 
-if [ "$BEFORE" != "$AFTER" ]; then
-    echo "fm-update: aktualisiert von ${BEFORE:0:8} auf ${AFTER:0:8}."
-    if [ -f requirements.txt ] && [ -x venv/bin/pip ]; then
-        venv/bin/pip install -q -r requirements.txt && echo "fm-update: Abhängigkeiten aktualisiert."
-    fi
-else
-    echo "fm-update: bereits aktuell."
+LATEST=$(git tag --list 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)
+if [ -z "$LATEST" ]; then
+    echo "fm-update: noch kein Release vorhanden."
+    exit 0
+fi
+
+if git merge-base --is-ancestor "$LATEST" HEAD; then
+    echo "fm-update: bereits aktuell ($LATEST ist enthalten)."
+    exit 0
+fi
+
+BEFORE=$(git rev-parse HEAD)
+if ! git merge --ff-only --quiet "$LATEST"; then
+    echo "fm-update: Update auf $LATEST nicht möglich (lokale Änderungen oder abweichende Historie?) — übersprungen." >&2
+    exit 1
+fi
+echo "fm-update: aktualisiert auf $LATEST (${BEFORE:0:8} -> $(git rev-parse --short=8 HEAD))."
+
+if git diff --name-only "$BEFORE" HEAD | grep -qx 'requirements.txt' && [ -x venv/bin/pip ]; then
+    venv/bin/pip install -q -r requirements.txt && echo "fm-update: Abhängigkeiten aktualisiert."
 fi

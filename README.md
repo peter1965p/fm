@@ -93,7 +93,7 @@ Was im Screenshot zu sehen ist:
 - Linux (getestet mit KDE Plasma unter Wayland)
 - Python 3 (getestet mit 3.14)
 - Optional, je nach Funktion:
-  - **git** für das automatische Update (`fm-update`)
+  - **git** für die Updates (`fm-update` und „Nach Updates suchen“)
   - **LibreOffice** (`soffice`) für die Vorschau von Office-Dateien
   - **Node.js + npm/npx** für die Node-, React-, Vue- und Angular-Vorlagen
   - **.NET SDK** für die .NET-Vorlagen
@@ -115,8 +115,8 @@ cd fm
 `install.sh` (als normaler Nutzer, **nicht** mit `sudo`) legt das venv an,
 installiert die Abhängigkeiten, richtet einen Menüeintrag ein, verlinkt
 `fm` nach `~/.local/bin`, fragt ob fm zum Standard-Dateimanager werden soll
-und aktiviert einen täglichen `systemd --user`-Timer, der automatisch
-`git pull` im Repo macht (`fm-update`). Alles rückgängig machen:
+und aktiviert einen täglichen `systemd --user`-Timer, der fm auf den neuesten
+Release aktualisiert (`fm-update`, siehe „Updates“). Alles rückgängig machen:
 `./uninstall.sh` (lässt Repo und venv unangetastet).
 
 Manuell, ohne die Skripte:
@@ -124,6 +124,32 @@ Manuell, ohne die Skripte:
 ```bash
 python3 -m venv venv
 venv/bin/pip install -r requirements.txt
+```
+
+## Updates
+
+fm aktualisiert sich über **Releases** (Git-Tags im Format `vX.Y.Z`). Es wird
+immer nur bis zum neuesten Release gezogen, nicht jeder neue Commit von `master`.
+
+- **In fm:** kurz nach dem Start und danach alle 6 Stunden sucht fm im
+  Hintergrund nach einem neuen Release und spielt es ein. Danach fragt es, ob
+  es neu starten soll. Von Hand: *Hilfe → Nach Updates suchen …*. Die
+  installierte Version steht unter *Hilfe → Über fm*.
+- **Ohne geöffnetes fm:** der Timer aus `install.sh` macht dasselbe einmal am Tag
+  (`systemctl --user start fm-update.service` stößt es sofort an,
+  `journalctl --user -u fm-update` zeigt das Protokoll).
+- **Sicher:** das Update ist ein reiner fast-forward-Merge. Bei lokalen
+  Änderungen, die dazwischenfunken, oder abweichender Historie bricht es mit einer
+  Meldung ab, statt etwas zu überschreiben oder zu stashen. Ändert sich
+  `requirements.txt`, werden die Abhängigkeiten automatisch nachinstalliert.
+- Ausschalten der Suche in der Oberfläche: Umgebungsvariable `FM_NO_UPDATE_CHECK=1`.
+
+**Einen Release veröffentlichen** (für Entwickler):
+
+```bash
+git tag v1.2.0 && git push origin v1.2.0
+# oder mit GitHub-Release-Seite:
+gh release create v1.2.0 --generate-notes
 ```
 
 ## Starten
@@ -170,7 +196,7 @@ Im Terminal werden alle Tastenkürzel an die Shell weitergegeben, außer F4 (Ter
 ```
 fm.py              Die gesamte Anwendung
 fm                 Startskript
-fm-update           Vom Auto-Update-Timer aufgerufen: git pull + pip install
+fm-update           Vom Auto-Update-Timer aufgerufen: Update auf neuesten Release
 install.sh          Richtet fm ein (venv, Menüeintrag, PATH, Auto-Update-Timer)
 uninstall.sh         Macht install.sh rückgängig (Repo/venv bleiben erhalten)
 requirements.txt    Python-Abhängigkeiten (PySide6, pyte, psutil)

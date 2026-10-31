@@ -4579,6 +4579,91 @@ class SystemManagerDialog(QDialog):
         super().hideEvent(event)
 
 
+# --------------------------------------------------------------------------
+# Selbst-Update über Releases (Git-Tags im Format vX.Y.Z)
+#
+# Die installierte Version ist der neueste Release-Tag, der im aktuellen
+# Stand enthalten ist (git tag --merged HEAD) — es gibt bewusst keine
+# Versionskonstante im Code, die man beim Release vergessen könnte. Ein
+# Update ist ein fast-forward-Merge auf den neuesten Tag: bricht bei
+# abweichender Historie oder kollidierenden lokalen Änderungen sauber ab,
+# statt etwas zu überschreiben, und zieht nie mehr als den Release-Stand
+# (kein "jeden Commit von master").
+# --------------------------------------------------------------------------
+
+REPO_DIR = Path(__file__).resolve().parent
+_RELEASE_TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
+
+
+def _git(repo: Path, *args: str, timeout: int = 20) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args], capture_output=True, text=True, timeout=timeout,
+    )
+
+
+def _release_key(tag: str) -> tuple[int, int, int] | None:
+    match = _RELEASE_TAG_RE.match(tag)
+    return tuple(int(part) for part in match.groups()) if match else None
+
+
+def current_version(repo: Path = REPO_DIR) -> str | None:
+    """Neuester Release-Tag im aktuellen Stand; None = noch kein Release
+    (Entwicklungsstand) oder kein Git-Checkout."""
+    try:
+        result = _git(repo, "tag", "--merged", "HEAD")
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    tags = [t for t in result.stdout.split() if _release_key(t)]
+    return max(tags, key=_release_key) if tags else None
+
+
+def check_and_apply_update(repo: Path = REPO_DIR, apply: bool = True) -> dict:
+    """Holt die Tags vom Remote und aktualisiert (apply=True) auf den
+    neuesten Release. Ergebnis: current, latest, available, applied, error."""
+    info = {"current": current_version(repo), "latest": None,
+            "available": False, "applied": False, "error": ""}
+    try:
+        fetch = _git(repo, "fetch", "--tags", "--quiet", "origin", timeout=30)
+        if fetch.returncode != 0:
+            info["error"] = fetch.stderr.strip() or "git fetch fehlgeschlagen"
+            return info
+        tags = [t for t in _git(repo, "tag").stdout.split() if _release_key(t)]
+        if not tags:
+            return info
+        latest = max(tags, key=_release_key)
+        info["latest"] = latest
+        if _git(repo, "merge-base", "--is-ancestor", latest, "HEAD").returncode == 0:
+            return info  # Release ist schon enthalten
+        info["available"] = True
+        if not apply:
+            return info
+
+        before = _git(repo, "rev-parse", "HEAD").stdout.strip()
+        merge = _git(repo, "merge", "--ff-only", "--quiet", latest, timeout=60)
+        if merge.returncode != 0:
+            info["error"] = (merge.stderr or merge.stdout).strip() or "Merge nicht möglich"
+            return info
+        changed = _git(repo, "diff", "--name-only", before, "HEAD").stdout.split()
+        if "requirements.txt" in changed:
+            pip = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-q", "-r", str(repo / "requirements.txt")],
+                capture_output=True, text=True, timeout=300,
+            )
+            if pip.returncode != 0:
+                info["error"] = "Release installiert, aber pip install schlug fehl: " + pip.stderr.strip()[-300:]
+        info["applied"] = True
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        info["error"] = str(exc)
+    return info
+
+
+class UpdateWorker(QObject):
+    finished = Signal(dict)
+
+    def run(self) -> None:
+        self.finished.emit(check_and_apply_update())
+
+
 class MainWindow(QMainWindow):
     def __init__(self, start_path: Path):
         super().__init__()
@@ -4646,11 +4731,76 @@ class MainWindow(QMainWindow):
 
         self._build_menu_bar()
 
+        # Update-Suche: einmal kurz nach dem Start, danach alle 6 Stunden.
+        # FM_NO_UPDATE_CHECK=1 schaltet sie ab (Tests, Offline-Betrieb).
+        self._update_thread: QThread | None = None
+        self._update_worker: UpdateWorker | None = None
+        self._update_manual = False
+        if not os.environ.get("FM_NO_UPDATE_CHECK"):
+            self._startup_update_timer = QTimer(self)
+            self._startup_update_timer.setSingleShot(True)
+            self._startup_update_timer.timeout.connect(lambda: self._check_updates(manual=False))
+            self._startup_update_timer.start(5000)
+            self._periodic_update_timer = QTimer(self)
+            self._periodic_update_timer.setInterval(6 * 60 * 60 * 1000)
+            self._periodic_update_timer.timeout.connect(lambda: self._check_updates(manual=False))
+            self._periodic_update_timer.start()
+
     def closeEvent(self, event) -> None:
         self.terminal_panel.shutdown()
         if self.system_manager is not None:
             self.system_manager.close()
+        if self._update_thread is not None and self._update_thread.isRunning():
+            self._update_thread.quit()
+            self._update_thread.wait(3000)
         super().closeEvent(event)
+
+    # ----------------------------------------------------------------
+    # Selbst-Update (Releases)
+    # ----------------------------------------------------------------
+
+    def _check_updates(self, manual: bool) -> None:
+        if self._update_thread is not None and self._update_thread.isRunning():
+            return
+        self._update_manual = manual
+        if manual:
+            self.status.showMessage("Suche nach Updates …")
+        thread = QThread(self)
+        worker = UpdateWorker()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_update_result)
+        worker.finished.connect(thread.quit)
+        self._update_thread, self._update_worker = thread, worker
+        thread.start()
+
+    def _on_update_result(self, info: dict) -> None:
+        manual = self._update_manual
+        if info["applied"]:
+            self.status.showMessage(f"fm {info['latest']} installiert — Neustart aktiviert es")
+            text = f"fm wurde auf {info['latest']} aktualisiert.\n\nJetzt neu starten?"
+            if info["error"]:
+                text += f"\n\nHinweis: {info['error']}"
+            answer = QMessageBox.question(
+                self, "Update installiert", text, QMessageBox.Yes | QMessageBox.No,
+            )
+            if answer == QMessageBox.Yes:
+                self._restart()
+        elif info["error"]:
+            if manual:
+                QMessageBox.warning(self, "Update fehlgeschlagen", info["error"])
+                self.status.showMessage("Update-Suche fehlgeschlagen")
+        elif manual:
+            current = info["current"] or "Entwicklungsstand (noch kein Release)"
+            if info["latest"] is None:
+                QMessageBox.information(self, "Updates", f"Es gibt noch keinen Release.\n\nAktuell: {current}")
+            else:
+                QMessageBox.information(self, "Updates", f"fm ist aktuell ({current}).")
+            self.status.clearMessage()
+
+    def _restart(self) -> None:
+        subprocess.Popen([sys.executable, *sys.argv])
+        self.close()
 
     def _open_system_manager(self) -> None:
         if self.system_manager is None:
@@ -4742,12 +4892,13 @@ class MainWindow(QMainWindow):
         go_menu.addAction("Anderes Pane aktivieren\tTab", self._toggle_active_pane)
 
         help_menu = menu_bar.addMenu("&Hilfe")
+        help_menu.addAction("Nach Updates suchen …", lambda: self._check_updates(manual=True))
         help_menu.addAction("Über fm", self._show_about)
 
     def _show_about(self) -> None:
         QMessageBox.about(
             self, "Über fm",
-            "fm — Dual-Pane Dateimanager mit Projekt-Scaffolder\n\n"
+            f"fm {current_version() or '(Entwicklungsstand)'} — Dual-Pane Dateimanager mit Projekt-Scaffolder\n\n"
             "Kopieren/Ausschneiden/Einfügen, Drag & Drop (Strg+Ziehen = "
             "Kopieren), Papierkorb, Vorschau und Projekt-Generator (F7).",
         )
